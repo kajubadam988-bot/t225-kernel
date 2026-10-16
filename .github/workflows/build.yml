@@ -6,9 +6,18 @@ on:
       ksu_ref:
         description: "legacy | legacy-susfs | legacy-susfs-nomount | legacy-susfs-manual | legacy-susfs-nomount-manual | susfs-*"
         default: "legacy-susfs-manual"
+      manager_apk_url:
+        description: "Direct link to the Manager .apk (optional; empty = latest *spoofed* APK from KernelSU-Next releases, else no APK)"
+        default: ""
+      toolchain:
+        description: "crdroid11 = original working clang 11.0.1 (default, safe) | llvm = experimental upstream LLVM (see llvm_url)"
+        default: "crdroid11"
+      llvm_url:
+        description: "Only for toolchain=llvm. Direct link to a Linux x86_64 LLVM .tar.xz (empty = LLVM 23.1.1 official release)"
+        default: ""
       features:
-        description: "Extra kernel features: bbr | bbr wireguard | none  (bbr = BBR+FQ+FQ_CODEL)"
-        default: "bbr"
+        description: "Extra kernel features (space separated): bbr | bbrdef | perf | wireguard | none  (bbr = BBR+FQ+FQ_CODEL available; bbrdef = also default cc/qdisc; perf = -O2 + BLK_WBT)"
+        default: "bbr bbrdef perf"
 
 permissions:
   contents: write
@@ -22,7 +31,10 @@ jobs:
       OUTDIR: ${{ github.workspace }}/_out
       GH_TOKEN: ${{ github.token }}
       KSU_REF: ${{ inputs.ksu_ref }}
+      APK_URL: ${{ inputs.manager_apk_url }}
       FEATURES: ${{ inputs.features }}
+      TOOLCHAIN: ${{ inputs.toolchain }}
+      LLVM_URL: ${{ inputs.llvm_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +42,67 @@ jobs:
         run: |
           gh release download src-v1 -R "$GITHUB_REPOSITORY" -p kernel_src.tar.gz -p T225_GitHub_Repo_Files.zip
           unzip -oq T225_GitHub_Repo_Files.zip -x '.github/*'
+
+      # Experimental: upstream LLVM instead of the crDroid clang 11.0.1.
+      # It is unpacked to $WORK/toolchain_611, so 01_setup.sh skips its own git clone and
+      # 02_build.sh picks it up unchanged. Extra -Wno flags are added because a new clang is
+      # much stricter than clang 11 on this old 4.19 vendor code. Default (crdroid11) is untouched.
+      - name: Install upstream LLVM toolchain (toolchain=llvm only)
+        if: inputs.toolchain == 'llvm'
+        run: |
+          URL="$LLVM_URL"
+          [ -z "$URL" ] && URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz"
+          echo "LLVM toolchain: $URL"
+          mkdir -p _llvm "$WORK"
+          curl -fL --retry 3 -o _llvm/llvm.tar.xz "$URL"
+          tar -C _llvm -xf _llvm/llvm.tar.xz
+          CLANG=$(find _llvm -type f -path '*/bin/clang' | head -1)
+          [ -n "$CLANG" ] || { echo "::error::bin/clang not found in the archive"; exit 1; }
+          rm -rf "$WORK/toolchain_611"
+          mv "$(dirname "$(dirname "$CLANG")")" "$WORK/toolchain_611"
+          rm -rf _llvm
+          "$WORK/toolchain_611/bin/clang" --version | head -1
+          python3 - <<'PY'
+          p = "scripts/02_build.sh"
+          s = open(p).read()
+          flags = ('KCFLAGS="-w -Wno-error -Wno-implicit-function-declaration -Wno-int-conversion '
+                   '-Wno-incompatible-function-pointer-types -Wno-implicit-int '
+                   '-Wno-deprecated-non-prototype -Wno-strict-prototypes"')
+          assert "KCFLAGS=-w" in s
+          open(p, "w").write(s.replace("KCFLAGS=-w", flags, 1))
+          PY
+          grep -n "KCFLAGS" scripts/02_build.sh
+
+      # Manager APK: the given link, or the newest *spoofed* release APK of KernelSU-Next.
+      # The driver is NOT affected: it always comes from KSU_REF. The APK's signing cert is
+      # added to the driver's accepted managers (KSU_EXTRA_CERTS) so a newer Manager is accepted.
+      - name: Fetch Manager APK (latest spoofed unless a link is given)
+        run: |
+          mkdir -p _apk
+          URL="$APK_URL"
+          if [ -z "$URL" ]; then
+            URL=$(gh api "repos/KernelSU-Next/KernelSU-Next/releases?per_page=10" \
+              --jq '[.[].assets[] | select(.name | test("spoofed.*release\\.apk$"))][0].browser_download_url // empty' || true)
+          fi
+          if [ -n "$URL" ] && curl -fsSL -o _apk/manager.apk "$URL" && [ -s _apk/manager.apk ]; then
+            echo "Manager APK: $URL"
+            CERT=$(python3 -I scripts/apk_cert_info.py --extra _apk/manager.apk)
+            echo "Manager cert: $CERT"
+            echo "KSU_EXTRA_CERTS=$CERT" >> "$GITHUB_ENV"
+            # Driver reports the same version as the Manager (e.g. v3.4.2 / 33355) instead of the
+            # branch's own tag/commit count (v3.4.0-legacy / 33313). Read from the APK file name.
+            NAME=$(basename "${URL%%\?*}")
+            if [[ "$NAME" =~ _v([0-9]+\.[0-9]+\.[0-9]+)[^_]*_([0-9]+)-release\.apk$ ]]; then
+              echo "KSU_VERSION_TAG_OVERRIDE=v${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+              echo "KSU_VERSION_OVERRIDE=${BASH_REMATCH[2]}" >> "$GITHUB_ENV"
+              echo "Driver version will be pinned to v${BASH_REMATCH[1]} (${BASH_REMATCH[2]})"
+            else
+              echo "::warning::Could not read version from APK name '$NAME'; driver keeps its own version"
+            fi
+          else
+            rm -f _apk/manager.apk
+            echo "::warning::No Manager APK fetched; the zip is built without it"
+          fi
 
       - name: Setup (deps, toolchain, source, KernelSU-Next)
         run: bash scripts/01_setup.sh "$KSU_REF"
@@ -44,6 +117,8 @@ jobs:
         run: |
           cd "$WORK/src/KernelSU"
           echo "Driver branch/ref: $KSU_REF  commit: $(git rev-parse --short HEAD)  describe: $(git describe --tags 2>/dev/null)"
+          echo "Pinned driver version: tag=${KSU_VERSION_TAG_OVERRIDE:-none} code=${KSU_VERSION_OVERRIDE:-none}"
+          grep -n "KernelSU-Next version\|KernelSU-Next tag" "$WORK/build.log" | head -4 || true
           grep -rn "KERNEL_SU_UAPI_VERSION" uapi/supercall.h kernel/uapi/supercall.h 2>/dev/null | head -2 || true
 
       - name: Verify extra features are in the final .config
@@ -54,14 +129,17 @@ jobs:
         run: grep -n "error:\|Error " "$WORK/build.log" | head -40 || true
 
       - name: Package flashable zip
-        run: bash scripts/03_package.sh
+        run: |
+          APK=""
+          [ -f _apk/manager.apk ] && APK="$PWD/_apk/manager.apk"
+          bash scripts/03_package.sh "$APK"
 
       - name: Publish Release
         run: |
           ZIP=$(ls "$OUTDIR"/*.zip)
           gh release create "build-${{ github.run_number }}" "$ZIP" \
-            --title "T225 build #${{ github.run_number }} (KernelSU-Next: $KSU_REF)" \
-            --notes "Auto-built flashable zip. Check after flashing: boots, WiFi/Bluetooth, overclock."
+            --title "T225 build #${{ github.run_number }} (KernelSU-Next: $KSU_REF, toolchain: $TOOLCHAIN)" \
+            --notes "Auto-built flashable zip (toolchain: $TOOLCHAIN). Check after flashing: boots, WiFi/Bluetooth, overclock. Keep a known-good zip for TWRP."
 
       - name: Keep build log on failure
         if: failure()
@@ -69,4 +147,3 @@ jobs:
         with:
           name: build-log
           path: _work/build.log
-          
