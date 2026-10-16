@@ -9,6 +9,9 @@ on:
       manager_apk_url:
         description: "Direct link to the Manager .apk (optional; empty = latest *spoofed* APK from KernelSU-Next releases, else no APK)"
         default: ""
+      bundle_apk:
+        description: "true = also put the Manager .apk inside the flashable zip (bigger zip). false (default) = not bundled; the APK is still used at build time for the signature and version"
+        default: "false"
       toolchain:
         description: "crdroid11 = original working clang 11.0.1 (default, safe) | llvm = experimental upstream LLVM (see llvm_url)"
         default: "crdroid11"
@@ -34,6 +37,7 @@ jobs:
       APK_URL: ${{ inputs.manager_apk_url }}
       FEATURES: ${{ inputs.features }}
       TOOLCHAIN: ${{ inputs.toolchain }}
+      BUNDLE_APK: ${{ inputs.bundle_apk }}
       LLVM_URL: ${{ inputs.llvm_url }}
     steps:
       - uses: actions/checkout@v4
@@ -136,7 +140,12 @@ jobs:
       - name: Package flashable zip
         run: |
           APK=""
-          [ -f _apk/manager.apk ] && APK="$PWD/_apk/manager.apk"
+          if [ "$BUNDLE_APK" = "true" ] && [ -f _apk/manager.apk ]; then
+            APK="$PWD/_apk/manager.apk"
+            echo "Manager APK will be bundled in the zip"
+          else
+            echo "Manager APK NOT bundled (bundle_apk=$BUNDLE_APK)"
+          fi
           bash scripts/03_package.sh "$APK"
 
       - name: Publish Release
