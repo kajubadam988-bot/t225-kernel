@@ -13,10 +13,10 @@ on:
         description: "true = also put the Manager .apk inside the flashable zip (bigger zip). false (default) = not bundled; the APK is still used at build time for the signature and version"
         default: "false"
       toolchain:
-        description: "crdroid11 = original working clang 11.0.1 (default, safe) | llvm = experimental upstream LLVM (see llvm_url)"
+        description: "crdroid11 = original working clang 11.0.1 (default, safe) | neutron = latest Neutron Clang (experimental) | llvm = experimental upstream LLVM (see llvm_url)"
         default: "crdroid11"
       llvm_url:
-        description: "Only for toolchain=llvm. Direct link to a Linux x86_64 LLVM .tar.xz (empty = LLVM 23.1.1 official release)"
+        description: "Only for toolchain=llvm or neutron. Direct link to a Linux x86_64 .tar.xz / .tar.zst (empty = llvm: LLVM 23.1.1 official | neutron: newest Neutron Clang release)"
         default: ""
       features:
         description: "Extra kernel features (space separated): bbr | bbrdef | perf | wireguard | none  (bbr = BBR+FQ+FQ_CODEL available; bbrdef = also default cc/qdisc; perf = -O2 + BLK_WBT)"
@@ -51,15 +51,29 @@ jobs:
       # It is unpacked to $WORK/toolchain_611, so 01_setup.sh skips its own git clone and
       # 02_build.sh picks it up unchanged. Extra -Wno flags are added because a new clang is
       # much stricter than clang 11 on this old 4.19 vendor code. Default (crdroid11) is untouched.
-      - name: Install upstream LLVM toolchain (toolchain=llvm only)
-        if: inputs.toolchain == 'llvm'
+      - name: Install experimental toolchain (toolchain=llvm or neutron)
+        if: inputs.toolchain == 'llvm' || inputs.toolchain == 'neutron'
         run: |
           URL="$LLVM_URL"
-          [ -z "$URL" ] && URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz"
-          echo "LLVM toolchain: $URL"
+          if [ -z "$URL" ]; then
+            if [ "$TOOLCHAIN" = "neutron" ]; then
+              # newest Neutron Clang build (catalogue repo releases, asset neutron-clang-<date>.tar.zst)
+              URL=$(gh api repos/Neutron-Toolchains/clang-build-catalogue/releases/latest \
+                --jq '[.assets[] | select(.name | test("^neutron-clang-.*\\.tar\\.zst$"))][0].browser_download_url // empty')
+              [ -z "$URL" ] && { echo "::error::could not find the latest Neutron Clang asset"; exit 1; }
+            else
+              URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz"
+            fi
+          fi
+          echo "Toolchain ($TOOLCHAIN): $URL"
+          sudo apt-get install -y zstd >/dev/null 2>&1 || true
           mkdir -p _llvm "$WORK"
-          curl -fL --retry 3 -o _llvm/llvm.tar.xz "$URL"
-          tar -C _llvm -xf _llvm/llvm.tar.xz
+          curl -fL --retry 3 -o _llvm/tc.archive "$URL"
+          case "$URL" in
+            *.zst) tar -C _llvm --zstd -xf _llvm/tc.archive ;;
+            *)     tar -C _llvm -xf _llvm/tc.archive ;;
+          esac
+          rm -f _llvm/tc.archive
           # bin/clang is a symlink (-> clang-23) in the official tarball, so accept files AND symlinks
           CLANG=$(find _llvm \( -type f -o -type l \) -path '*/bin/clang' | head -1)
           if [ -z "$CLANG" ]; then
