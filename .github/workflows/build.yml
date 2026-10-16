@@ -1,4 +1,3 @@
-
 name: Build T225 KernelSU-Next kernel
 
 on:
@@ -98,9 +97,23 @@ jobs:
                 URL=$(gh api repos/Neutron-Toolchains/clang-build-catalogue/releases/latest \
                   --jq '[.assets[] | select(.name | test("^neutron-clang-.*\\.tar\\.zst$"))][0].browser_download_url // empty') ;;
               zyc)
-                # newest ZyC Clang release (asset Clang-<ver>-<date>.tar.gz, ~570 MB)
-                URL=$(gh api repos/ZyCromerZ/Clang/releases/latest \
-                  --jq '[.assets[] | select(.name | test("\\.tar\\.(gz|xz|zst)$"))][0].browser_download_url // empty') ;;
+                # ZyC publishes several clang lines (14.0.6, 16.0.6, 21.0.0git ...), and "releases/latest"
+                # returns whichever line was uploaded LAST -> random version. So pick the highest
+                # version line, newest date inside it (asset Clang-<ver>-<date>.tar.gz, ~570 MB).
+                URL=$(gh api "repos/ZyCromerZ/Clang/releases?per_page=100" \
+                  --jq '.[] | select(.prerelease==false) | .assets[] | select(.name | test("^Clang-.*\\.tar\\.(gz|xz|zst)$")) | "\(.name) \(.browser_download_url)"' \
+                  | python3 -c '
+          import re, sys
+          best = None
+          for l in sys.stdin:
+              n, u = l.split()
+              m = re.match(r"Clang-(.+)-(\d{8})\.tar", n)
+              if not m: continue
+              ver = tuple(int(x) for x in re.findall(r"\d+", m.group(1))[:3])
+              key = (ver, int(m.group(2)))
+              if best is None or key > best[0]: best = (key, u)
+          print(best[1] if best else "")
+          ') ;;
               slim)
                 # newest stable (non -rc) Slim LLVM from kernel.org
                 BASE="https://mirrors.edge.kernel.org/pub/tools/llvm/files"
@@ -182,6 +195,39 @@ jobs:
           bash scripts/02_build.sh
           tail -n 3 "$WORK/build.log"
           grep -q 'BUILD_EXIT=0' "$WORK/build.log"
+
+      # Right after the build: show which compiler/config was used and check the export-table
+      # format. The WiFi/BT CRC patch in the packaging step needs 8-byte __ksymtab entries (one 4-byte
+      # __kcrctab entry each). Some toolchains/options produce 16-byte entries -> the zip would be
+      # unusable, so we stop here with a clear message and the .config lines that decide it.
+      - name: Check export-table format (needed for the WiFi/BT CRC patch)
+        run: |
+          cd "$WORK/src"
+          echo "compiler: $(grep -m1 LINUX_COMPILER out/include/generated/compile.h || true)"
+          echo "linker:   $("$WORK/toolchain_611/bin/ld.lld" --version 2>/dev/null | head -1)"
+          echo "--- export-table sections (Size / Flg / Al):"
+          readelf -S -W out/vmlinux | grep -E 'ksymtab|kcrctab' || true
+          echo "--- relevant .config lines:"
+          grep -E '^(# )?CONFIG_(HAVE_ARCH_PREL32_RELOCATIONS|MODULE_REL_CRCS|MODVERSIONS|RELOCATABLE|RANDOMIZE_BASE|LTO|THINLTO|CFI|CC_IS_CLANG|CLANG_VERSION|CC_VERSION_TEXT|ARM64_MODULE_PLTS)[= ]' out/.config || true
+          python3 - <<'PY'
+          import re, subprocess, sys
+          out = subprocess.run(['readelf', '-S', '-W', 'out/vmlinux'], capture_output=True, text=True).stdout
+          sz = {}
+          for l in out.split('\n'):
+              m = re.match(r'\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+[0-9a-f]+\s+[0-9a-f]+\s+([0-9a-f]+)', l)
+              if m: sz[m.group(1)] = int(m.group(2), 16)
+          bad = False
+          for k in ('', '_gpl'):
+              ks, kc = sz.get('__ksymtab' + k, 0), sz.get('__kcrctab' + k, 0)
+              per = (ks * 4 / kc) if kc else 0   # bytes per ksymtab entry (one 4-byte crc each)
+              print(f'__ksymtab{k}: {ks} B, __kcrctab{k}: {kc} B -> {per:.0f} bytes per ksymtab entry (need 8)')
+              if kc and ks != 2 * kc: bad = True   # 8-byte entries <=> ksymtab is exactly twice kcrctab
+          if bad:
+              print('::error::This toolchain/config builds 16-byte export-table entries (stock modules need 8). '
+                    'The zip would not load WiFi/BT. Use toolchain=zyc or crdroid11, or send the .config lines above.')
+              sys.exit(1)
+          print('export-table format OK (8-byte entries)')
+          PY
 
       - name: Show KernelSU-Next driver version
         run: |
