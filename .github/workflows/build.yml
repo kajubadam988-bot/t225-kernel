@@ -56,8 +56,13 @@ jobs:
           mkdir -p _llvm "$WORK"
           curl -fL --retry 3 -o _llvm/llvm.tar.xz "$URL"
           tar -C _llvm -xf _llvm/llvm.tar.xz
-          CLANG=$(find _llvm -type f -path '*/bin/clang' | head -1)
-          [ -n "$CLANG" ] || { echo "::error::bin/clang not found in the archive"; exit 1; }
+          # bin/clang is a symlink (-> clang-23) in the official tarball, so accept files AND symlinks
+          CLANG=$(find _llvm \( -type f -o -type l \) -path '*/bin/clang' | head -1)
+          if [ -z "$CLANG" ]; then
+            echo "::error::bin/clang not found in the archive. Top-level content:"
+            ls -la _llvm | head -20
+            exit 1
+          fi
           rm -rf "$WORK/toolchain_611"
           mv "$(dirname "$(dirname "$CLANG")")" "$WORK/toolchain_611"
           rm -rf _llvm
@@ -147,3 +152,4 @@ jobs:
         with:
           name: build-log
           path: _work/build.log
+          
