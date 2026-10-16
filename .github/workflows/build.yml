@@ -254,6 +254,10 @@ jobs:
             echo "Manager APK NOT bundled (bundle_apk=$BUNDLE_APK)"
           fi
           bash scripts/03_package.sh "$APK"
+          for f in "$OUTDIR"/T225_*.zip; do
+            mv "$f" "$OUTDIR/${TOOLCHAIN}-$(basename "$f")"
+          done
+          ls -l "$OUTDIR"
 
       - name: Publish Release
         run: |
