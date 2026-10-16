@@ -209,8 +209,37 @@ jobs:
         run: |
           ZIP=$(ls "$OUTDIR"/*.zip)
           gh release create "build-${{ github.run_number }}" "$ZIP" \
-            --title "T225 build #${{ github.run_number }} (KernelSU-Next: $KSU_REF, toolchain: $TOOLCHAIN)" \
+            --title "T225 build #${{ github.run_number }} ($KSU_REF | $TOOLCHAIN | $IOSCHED)" \
             --notes "Auto-built flashable zip (toolchain: $TOOLCHAIN). Check after flashing: boots, WiFi/Bluetooth, overclock. Keep a known-good zip for TWRP."
+
+      # Upload the finished zip to Telegram (needs repo secrets TG_BOT_TOKEN and TG_CHAT_ID).
+      # Runs only after a successful build; a Telegram problem never fails the build.
+      - name: Send zip to Telegram
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "::warning::TG_BOT_TOKEN / TG_CHAT_ID secret not set, skipping Telegram upload"; exit 0
+          fi
+          ZIP=$(ls "$OUTDIR"/*.zip)
+          SIZE=$(stat -c%s "$ZIP")
+          if [ "$SIZE" -gt 50000000 ]; then
+            echo "::warning::zip is $SIZE bytes, over the Telegram bot limit (50 MB), skipping"; exit 0
+          fi
+          CAPTION="T225 build #${{ github.run_number }} OK
+          KSU: $KSU_REF
+          Toolchain: $TOOLCHAIN | I/O: $IOSCHED
+          Features: $FEATURES
+          ${{ github.server_url }}/${{ github.repository }}/releases/tag/build-${{ github.run_number }}"
+          if curl -sS --retry 3 -o tg_resp.json \
+               -F chat_id="$TG_CHAT_ID" -F document=@"$ZIP" -F caption="$CAPTION" \
+               "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
+             && grep -q '"ok":true' tg_resp.json; then
+            echo "Telegram upload OK"
+          else
+            echo "::warning::Telegram upload failed:"; cat tg_resp.json 2>/dev/null || true
+          fi
 
       - name: Keep build log on failure
         if: failure()
