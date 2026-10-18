@@ -24,6 +24,12 @@ on:
       iosched:
         description: "I/O scheduler set at boot: deadline (default, same as before) | kyber | bfq  (bfq also turns on the BFQ kernel option automatically)"
         default: "deadline"
+      gpu_oc_mhz:
+        description: "GPU top-OPP max MHz (stock 680). Empty = GPU OC off. e.g. 750"
+        default: "750"
+      gpu_oc_volt:
+        description: "GPU top-OPP volt (mV x 100, stock 80000). 82500 = 0.825 V"
+        default: "82500"
 
 permissions:
   contents: write
@@ -43,6 +49,8 @@ jobs:
       BUNDLE_APK: ${{ inputs.bundle_apk }}
       LLVM_URL: ${{ inputs.llvm_url }}
       IOSCHED: ${{ inputs.iosched }}
+      GPU_OC_MHZ: ${{ inputs.gpu_oc_mhz }}
+      GPU_OC_VOLT: ${{ inputs.gpu_oc_volt }}
     steps:
       - uses: actions/checkout@v4
 
@@ -190,6 +198,21 @@ jobs:
       - name: Setup (deps, toolchain, source, KernelSU-Next)
         run: bash scripts/01_setup.sh "$KSU_REF"
 
+      # GPU overclock: SM-T225 uses the MT6765 "segment 3" GPU table (680/500/400 MHz).
+      # Only the top row is changed (680 MHz -> gpu_oc_mhz, 0.800 V -> gpu_oc_volt).
+      # VSRAM stays 0.875 V. gpu_oc_mhz empty = step skipped = stock GPU.
+      - name: GPU overclock (MT6765 segment 3 top OPP)
+        if: inputs.gpu_oc_mhz != ''
+        run: |
+          set -e
+          H="$WORK/src/drivers/gpu/mediatek/gpufreq/mt6765/mtk_gpufreq_core.h"
+          test -f "$H" || { echo "::error::mt6765 gpufreq header not found"; exit 1; }
+          sed -i -E "s/^(#define SEG3_GPU_DVFS_FREQ0[[:space:]]+)\(680000\)/\1(${GPU_OC_MHZ}000)/" "$H"
+          sed -i -E "s/^(#define SEG3_GPU_DVFS_VOLT0[[:space:]]+)\(80000\)/\1(${GPU_OC_VOLT})/" "$H"
+          grep -n "SEG3_GPU_DVFS_FREQ0\|SEG3_GPU_DVFS_VOLT0\|SEG3_GPU_DVFS_VSRAM0" "$H"
+          grep -q "SEG3_GPU_DVFS_FREQ0[[:space:]]*(${GPU_OC_MHZ}000)" "$H" || { echo "::error::GPU freq not patched"; exit 1; }
+          grep -q "SEG3_GPU_DVFS_VOLT0[[:space:]]*(${GPU_OC_VOLT})" "$H" || { echo "::error::GPU volt not patched"; exit 1; }
+
       - name: Build kernel
         run: |
           bash scripts/02_build.sh
@@ -303,6 +326,7 @@ jobs:
             "Driver: $KSUV @ $KSUC" \
             "Compiler: $CC" \
             "Toolchain: $TOOLCHAIN | I/O: $IOSCHED" \
+            "GPU OC: ${GPU_OC_MHZ:-off} MHz / ${GPU_OC_VOLT:-stock}" \
             "Kernel: ${KVER:-?}" \
             "Features: $FEATURES" \
             "APK bundled: $BUNDLE_APK" \
