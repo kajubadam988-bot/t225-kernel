@@ -268,10 +268,12 @@ jobs:
           grep -q "SEG3_GPU_DVFS_FREQ0[[:space:]]*(${GPU_OC_MHZ}000)" "$H" || { echo "::error::GPU freq not patched"; exit 1; }
           grep -q "SEG3_GPU_DVFS_VOLT0[[:space:]]*(${GPU_OC_VOLT})" "$H" || { echo "::error::GPU volt not patched"; exit 1; }
 
-      # Little cluster (LL) overclock: the T225 runs the C65T OPP table. Only the top row of LL
-      # changes (1800 -> little_oc_mhz). Voltage index stays 96 (same as stock top, same as the L
-      # cluster's 2501 MHz top). 1901 MHz at index 96 is MTK's own qualified bin (SB table); 2300 is experimental.
-      - name: Little cluster overclock (LL top OPP, C65T)
+      # Little cluster (LL) overclock. The kernel picks the OPP table from an efuse value at boot:
+      # C65T (efuse 0x2/0x5) or C65 (0x3/0x4 and the default for unknown values) - both have LL top = 1800.
+      # The T225 reports an LL top of 1800 and could be either one, so BOTH tables are patched
+      # (the unused one is harmless). Only the top row of LL changes (1800 -> little_oc_mhz); voltage
+      # index stays 96. 1901 MHz is MTK's own qualified bin (SB table); 2300 is experimental.
+      - name: Little cluster overclock (LL top OPP, C65T + C65)
         if: inputs.little_oc_mhz != ''
         run: |
           set -e
@@ -279,11 +281,15 @@ jobs:
           T="$D/mtk_cpufreq_opp_table.h"
           P="$D/mtk_cpufreq_opp_pv_table.h"
           test -f "$T" && test -f "$P" || { echo "::error::mt6765 cpufreq tables not found"; exit 1; }
-          sed -i -E "s/^(#define CPU_DVFS_FREQ0_LL_C65T[[:space:]]+)1800000/\1${LITTLE_OC_MHZ}000/" "$T"
-          sed -i -E "/static unsigned int c65tTbl/,/^};/ s/\{ 1800, 96, 1, 1 \}/{ ${LITTLE_OC_MHZ}, 96, 1, 1 }/" "$P"
-          grep -n "CPU_DVFS_FREQ0_LL_C65T" "$T"
-          grep -q "CPU_DVFS_FREQ0_LL_C65T[[:space:]]*${LITTLE_OC_MHZ}000" "$T" || { echo "::error::LL opp table not patched"; exit 1; }
-          awk '/static unsigned int c65tTbl/{f=1} f&&/\/\* LL \*\//{print; exit}' "$P" | grep -q "{ ${LITTLE_OC_MHZ}, 96, 1, 1 }" || { echo "::error::LL pv table not patched"; exit 1; }
+          for V in C65T C65; do
+            sed -i -E "s/^(#define CPU_DVFS_FREQ0_LL_${V}[[:space:]]+)1800000/\1${LITTLE_OC_MHZ}000/" "$T"
+            grep -q "^#define CPU_DVFS_FREQ0_LL_${V}[[:space:]]*${LITTLE_OC_MHZ}000" "$T" || { echo "::error::LL opp table $V not patched"; exit 1; }
+          done
+          for TBL in c65tTbl c65Tbl; do
+            sed -i -E "/static unsigned int ${TBL}\[/,/^};/ s/\{ 1800, 96, 1, 1 \}/{ ${LITTLE_OC_MHZ}, 96, 1, 1 }/" "$P"
+            awk -v t="static unsigned int ${TBL}[" 'index($0,t){f=1} f&&/\/\* LL \*\//{print; exit}' "$P" | grep -q "{ ${LITTLE_OC_MHZ}, 96, 1, 1 }" || { echo "::error::LL pv table $TBL not patched"; exit 1; }
+          done
+          grep -n "CPU_DVFS_FREQ0_LL_C65" "$T"
 
       - name: Build kernel
         run: |
