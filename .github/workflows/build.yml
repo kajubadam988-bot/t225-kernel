@@ -20,7 +20,7 @@ on:
         default: ""
       features:
         description: "Extra kernel features (space separated): bbr | bbrdef | perf | wireguard | none  (bbr = BBR+FQ+FQ_CODEL available; bbrdef = also default cc/qdisc; perf = -O2 + BLK_WBT)"
-        default: "bbr bbrdef perf"
+        default: "bbr bbrdef perf wireguard"
       iosched:
         description: "I/O scheduler set at boot: deadline (default, same as before) | kyber | bfq  (bfq also turns on the BFQ kernel option automatically)"
         default: "deadline"
@@ -30,6 +30,9 @@ on:
       gpu_oc_volt:
         description: "GPU top-OPP volt (mV x 100, stock 80000). 82500 = 0.825 V"
         default: "82500"
+      little_oc_mhz:
+        description: "Little cluster (LL, CPU4-7) top-OPP MHz (stock 1800; 1901 = MTK's own SB bin; 2300 = experimental). Empty = off"
+        default: "2300"
 
 permissions:
   contents: write
@@ -51,6 +54,7 @@ jobs:
       IOSCHED: ${{ inputs.iosched }}
       GPU_OC_MHZ: ${{ inputs.gpu_oc_mhz }}
       GPU_OC_VOLT: ${{ inputs.gpu_oc_volt }}
+      LITTLE_OC_MHZ: ${{ inputs.little_oc_mhz }}
     steps:
       - uses: actions/checkout@v4
 
@@ -213,6 +217,23 @@ jobs:
           grep -q "SEG3_GPU_DVFS_FREQ0[[:space:]]*(${GPU_OC_MHZ}000)" "$H" || { echo "::error::GPU freq not patched"; exit 1; }
           grep -q "SEG3_GPU_DVFS_VOLT0[[:space:]]*(${GPU_OC_VOLT})" "$H" || { echo "::error::GPU volt not patched"; exit 1; }
 
+      # Little cluster (LL) overclock: the T225 runs the C65T OPP table. Only the top row of LL
+      # changes (1800 -> little_oc_mhz). Voltage index stays 96 (same as stock top, same as the L
+      # cluster's 2501 MHz top). 1901 MHz at index 96 is MTK's own qualified bin (SB table); 2300 is experimental.
+      - name: Little cluster overclock (LL top OPP, C65T)
+        if: inputs.little_oc_mhz != ''
+        run: |
+          set -e
+          D="$WORK/src/drivers/misc/mediatek/base/power/cpufreq_v1/src/mach/mt6765"
+          T="$D/mtk_cpufreq_opp_table.h"
+          P="$D/mtk_cpufreq_opp_pv_table.h"
+          test -f "$T" && test -f "$P" || { echo "::error::mt6765 cpufreq tables not found"; exit 1; }
+          sed -i -E "s/^(#define CPU_DVFS_FREQ0_LL_C65T[[:space:]]+)1800000/\1${LITTLE_OC_MHZ}000/" "$T"
+          sed -i -E "/static unsigned int c65tTbl/,/^};/ s/\{ 1800, 96, 1, 1 \}/{ ${LITTLE_OC_MHZ}, 96, 1, 1 }/" "$P"
+          grep -n "CPU_DVFS_FREQ0_LL_C65T" "$T"
+          grep -q "CPU_DVFS_FREQ0_LL_C65T[[:space:]]*${LITTLE_OC_MHZ}000" "$T" || { echo "::error::LL opp table not patched"; exit 1; }
+          awk '/static unsigned int c65tTbl/{f=1} f&&/\/\* LL \*\//{print; exit}' "$P" | grep -q "{ ${LITTLE_OC_MHZ}, 96, 1, 1 }" || { echo "::error::LL pv table not patched"; exit 1; }
+
       - name: Build kernel
         run: |
           bash scripts/02_build.sh
@@ -327,6 +348,7 @@ jobs:
             "Compiler: $CC" \
             "Toolchain: $TOOLCHAIN | I/O: $IOSCHED" \
             "GPU OC: ${GPU_OC_MHZ:-off} MHz / ${GPU_OC_VOLT:-stock}" \
+            "LL OC: ${LITTLE_OC_MHZ:-off} MHz" \
             "Kernel: ${KVER:-?}" \
             "Features: $FEATURES" \
             "APK bundled: $BUNDLE_APK" \
