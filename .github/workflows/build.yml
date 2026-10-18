@@ -19,8 +19,8 @@ on:
         description: "For neutron/zyc/slim/llvm only. Direct link to a Linux x86_64 .tar.xz / .tar.zst / .tar.gz (empty = auto: newest release of the chosen toolchain; llvm = LLVM 23.1.1 official)"
         default: ""
       features:
-        description: "Extra kernel features (space separated): bbr | bbrdef | perf | wireguard | none  (bbr = BBR+FQ+FQ_CODEL available; bbrdef = also default cc/qdisc; perf = -O2 + BLK_WBT)"
-        default: "bbr bbrdef perf wireguard"
+        description: "Extra kernel features (space separated): bbr | bbrdef | perf | none  (bbr = BBR+FQ+FQ_CODEL available; bbrdef = also default cc/qdisc; perf = -O2 + BLK_WBT)"
+        default: "bbr bbrdef perf"
       iosched:
         description: "I/O scheduler set at boot: deadline (default, same as before) | kyber | bfq  (bfq also turns on the BFQ kernel option automatically)"
         default: "deadline"
@@ -201,23 +201,6 @@ jobs:
 
       - name: Setup (deps, toolchain, source, KernelSU-Next)
         run: bash scripts/01_setup.sh "$KSU_REF"
-
-      # WireGuard compat fix: wireguard-linux-compat thinks 4.19 lacks ktime_get_coarse_boottime_ns()
-      # and defines it again, but this Samsung 4.19.191 kernel already has it ->
-      # "error: redefinition of 'ktime_get_coarse_boottime_ns'". The compat copy is switched off (#if 0).
-      - name: WireGuard compat fix (ktime_get_coarse_boottime_ns)
-        if: contains(inputs.features, 'wireguard')
-        run: |
-          python3 - <<'PY'
-          import os, re
-          p = os.environ["WORK"] + "/src/net/wireguard/compat/compat.h"
-          s = open(p).read()
-          pat = re.compile(r"static inline u64 ktime_get_coarse_boottime_ns\(void\)\s*\{.*?\n\}\n", re.S)
-          assert len(pat.findall(s)) == 1, "definition not found exactly once"
-          s = pat.sub(lambda m: "#if 0 /* already in this kernel */\n" + m.group(0) + "#endif\n", s, count=1)
-          open(p, "w").write(s)
-          PY
-          grep -n -B1 -A5 "ktime_get_coarse_boottime_ns" "$WORK/src/net/wireguard/compat/compat.h"
 
       # GPU overclock: SM-T225 uses the MT6765 "segment 3" GPU table (680/500/400 MHz).
       # Only the top row is changed (680 MHz -> gpu_oc_mhz, 0.800 V -> gpu_oc_volt).
