@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       ksu_ref:
-        description: "legacy | legacy-susfs | legacy-susfs-nomount | legacy-susfs-manual | legacy-susfs-nomount-manual | susfs-*"
-        default: "legacy-susfs-manual"
+        description: "legacy | legacy-susfs | legacy-susfs-nomount | legacy-susfs-manual | legacy-susfs-nomount-manual | susfs-*   Suffix @auto (e.g. legacy-susfs-manual@auto) = driver commit auto-matched to the Manager's UAPI; @<commit> = fixed commit"
+        default: "legacy-susfs-manual@auto"
       manager_apk_url:
         description: "Direct link to the Manager .apk (optional; empty = latest *spoofed* APK from KernelSU-Next releases, else no APK)"
         default: ""
@@ -197,6 +197,57 @@ jobs:
           else
             rm -f _apk/manager.apk
             echo "::warning::No Manager APK fetched; the zip is built without it"
+          fi
+
+      # ksu_ref ends with "@auto" (e.g. legacy-susfs-manual@auto): pick the newest legacy driver commit
+      # whose KERNEL_SU_UAPI_VERSION equals the one the Manager expects. The Manager's UAPI is read from
+      # uapi/supercall.h at the Manager's release tag (tag taken from the APK file name, else the newest
+      # stable tag). Result is written back into KSU_REF as "<ref>@<commit>", so 01_setup.sh is unchanged.
+      # Any problem -> warning and plain branch HEAD (same as writing the ref without "@").
+      - name: Auto-pick KernelSU-Next driver commit (match Manager UAPI)
+        if: endsWith(inputs.ksu_ref, '@auto')
+        run: |
+          BASE="${KSU_REF%@auto}"
+          case "$BASE" in
+            legacy*) ;;
+            *) echo "::warning::@auto only supports legacy* refs; using '$BASE' as is"; echo "KSU_REF=$BASE" >> "$GITHUB_ENV"; exit 0 ;;
+          esac
+          cat > "$RUNNER_TEMP/pick.sh" <<'EOS'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          REPO=https://github.com/KernelSU-Next/KernelSU-Next.git
+          TAG="${1:-}"; BRANCH=legacy; HDR=uapi/supercall.h
+          D="$(mktemp -d)"
+          uapi_at() { git -C "$D" show "$1:$HDR" 2>/dev/null | sed -nE 's/^[^\/]*KERNEL_SU_UAPI_VERSION[[:space:]]*=?[[:space:]]*([0-9]+).*/\1/p' | head -1; }
+          if [ -z "$TAG" ]; then
+            TAG="$(git ls-remote --tags --refs "$REPO" 'v[0-9]*' | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+            echo "No APK tag known; newest stable tag: $TAG"
+          fi
+          [ -n "$TAG" ] || { echo "no tag"; exit 1; }
+          git clone --quiet --filter=blob:none --no-checkout "$REPO" "$D" || exit 1
+          git -C "$D" rev-parse -q --verify "refs/tags/$TAG" >/dev/null || { echo "tag $TAG not found"; exit 1; }
+          TARGET="$(uapi_at "refs/tags/$TAG")"; [ -n "$TARGET" ] || { echo "cannot read UAPI of $TAG"; exit 1; }
+          echo "Manager $TAG expects UAPI = $TARGET"
+          HEADSHA="$(git -C "$D" rev-parse "origin/$BRANCH")"
+          mapfile -t T < <(git -C "$D" log --format=%H "origin/$BRANCH" -- "$HDR")
+          PIN=""
+          for i in "${!T[@]}"; do
+            [ "$(uapi_at "${T[$i]}")" = "$TARGET" ] || continue
+            if [ "$i" -eq 0 ]; then PIN="$HEADSHA"; else PIN="$(git -C "$D" rev-parse "${T[$((i-1))]}^")"; fi
+            break
+          done
+          [ -n "$PIN" ] || { echo "no $BRANCH commit with UAPI $TARGET"; exit 3; }
+          echo "Chosen driver commit ${PIN:0:8} (driver UAPI $(uapi_at "$PIN"), manager UAPI $TARGET)"
+          echo "PIN=${PIN:0:8}" > "$RUNNER_TEMP/pin.txt"
+          EOS
+          rm -f "$RUNNER_TEMP/pin.txt"
+          if bash "$RUNNER_TEMP/pick.sh" "${KSU_VERSION_TAG_OVERRIDE:-}" && [ -s "$RUNNER_TEMP/pin.txt" ]; then
+            . "$RUNNER_TEMP/pin.txt"
+            echo "KSU_REF=${BASE}@${PIN}" >> "$GITHUB_ENV"
+            echo "KSU_REF -> ${BASE}@${PIN}"
+          else
+            echo "::warning::Auto-pick failed; driver = newest commit of the branch (Manager/driver UAPI may differ)"
+            echo "KSU_REF=$BASE" >> "$GITHUB_ENV"
           fi
 
       - name: Setup (deps, toolchain, source, KernelSU-Next)
