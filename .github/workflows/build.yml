@@ -33,6 +33,9 @@ on:
       little_oc_mhz:
         description: "Little cluster (LL, CPU4-7) top-OPP MHz (stock 1800; 1901 = MTK's own SB bin; 2300 = experimental). Empty = off"
         default: "2300"
+      zram_max_mb:
+        description: "Cap zram size inside the kernel (MB, 512-8192). Android asks for 4096; the kernel clamps it at boot, so no swapoff/reset is needed. Empty = off (stays 4 GB)"
+        default: "2048"
 
 permissions:
   contents: write
@@ -55,6 +58,7 @@ jobs:
       GPU_OC_MHZ: ${{ inputs.gpu_oc_mhz }}
       GPU_OC_VOLT: ${{ inputs.gpu_oc_volt }}
       LITTLE_OC_MHZ: ${{ inputs.little_oc_mhz }}
+      ZRAM_MAX_MB: ${{ inputs.zram_max_mb }}
     steps:
       - uses: actions/checkout@v4
 
@@ -291,6 +295,34 @@ jobs:
           done
           grep -n "CPU_DVFS_FREQ0_LL_C65" "$T"
 
+      # zram size cap: Android (fstab zramsize) writes 4 GB to /sys/block/zram0/disksize at boot.
+      # The kernel clamps that single write to zram_max_mb, so zram is small from the very first
+      # moment: no swapoff / reset / retry loop in userspace (that caused slowdowns and bootloops
+      # when tried from a module). The compressor stays the kernel default (lz4). Empty = off.
+      - name: zram size cap (kernel clamps disksize)
+        if: inputs.zram_max_mb != ''
+        run: |
+          set -e
+          case "$ZRAM_MAX_MB" in ''|*[!0-9]*) echo "::error::zram_max_mb must be a number"; exit 1 ;; esac
+          [ "$ZRAM_MAX_MB" -ge 512 ] && [ "$ZRAM_MAX_MB" -le 8192 ] || { echo "::error::zram_max_mb must be 512-8192"; exit 1; }
+          F="$WORK/src/drivers/block/zram/zram_drv.c"
+          test -f "$F" || { echo "::error::zram_drv.c not found"; exit 1; }
+          python3 - "$F" "$ZRAM_MAX_MB" <<'PY'
+          import sys
+          p, mb = sys.argv[1], int(sys.argv[2])
+          s = open(p).read()
+          a = "\tdisksize = memparse(buf, NULL);\n\tif (!disksize)\n\t\treturn -EINVAL;\n"
+          assert s.count(a) == 1, "disksize anchor not found exactly once"
+          ins = ("\n\t/* T225: cap zram size (set at build time) */\n"
+                 "\tif (disksize > ((u64)%d << 20)) {\n"
+                 "\t\tpr_info(\"zram: disksize %%llu MB capped to %d MB\\n\",\n"
+                 "\t\t\t(unsigned long long)(disksize >> 20));\n"
+                 "\t\tdisksize = (u64)%d << 20;\n"
+                 "\t}\n") % (mb, mb, mb)
+          open(p, "w").write(s.replace(a, a + ins, 1))
+          PY
+          grep -n -B1 -A6 "T225: cap zram" "$F"
+
       - name: Build kernel
         run: |
           bash scripts/02_build.sh
@@ -406,6 +438,7 @@ jobs:
             "Toolchain: $TOOLCHAIN | I/O: $IOSCHED" \
             "GPU OC: ${GPU_OC_MHZ:-off} MHz / ${GPU_OC_VOLT:-stock}" \
             "LL OC: ${LITTLE_OC_MHZ:-off} MHz" \
+            "zram cap: ${ZRAM_MAX_MB:-off} MB" \
             "Kernel: ${KVER:-?}" \
             "Features: $FEATURES" \
             "APK bundled: $BUNDLE_APK" \
