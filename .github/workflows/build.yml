@@ -34,8 +34,8 @@ on:
         description: "Little cluster (LL, CPU4-7) top-OPP MHz (stock 1800; 1901 = MTK's own SB bin; 2300 = experimental). Empty = off"
         default: "2300"
       zram_max_mb:
-        description: "Cap zram size inside the kernel (MB, 512-8192). Android asks for 4096; the kernel clamps it at boot, so no swapoff/reset is needed. Empty = off (stays 4 GB)"
-        default: "2048"
+        description: "Cap zram size inside the kernel (MB, 512-8192). Android asks for 4096; the kernel clamps it at boot, so no swapoff/reset is needed. Empty = off (stays 4 GB, default now)"
+        default: ""
 
 permissions:
   contents: write
