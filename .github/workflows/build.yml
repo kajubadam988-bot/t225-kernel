@@ -33,12 +33,6 @@ on:
       little_oc_mhz:
         description: "Little cluster (LL, CPU4-7) top-OPP MHz (stock 1800; 1901 = MTK's own SB bin; 2300 = experimental). Empty = off"
         default: "2300"
-      ll_mid_mhz:
-        description: "Extra LL (CPU4-7) step inserted at slot 1, between the top step and 1682 (drops the unused 501 MHz step). Empty = off. e.g. 2000. Must be below little_oc_mhz (with stock 1800 top use 1750)"
-        default: "2000"
-      ll_mid_volt_idx:
-        description: "Voltage index of that step (96 = 1.11875 V, same as the LL top step = safest; 92 = 1.09375 V cooler, test later). Allowed 88-96"
-        default: "96"
       zram_max_mb:
         description: "Cap zram size inside the kernel (MB, 512-8192). Android asks for 4096; the kernel clamps it at boot, so no swapoff/reset is needed. Empty = off (stays 4 GB, default now)"
         default: ""
@@ -64,8 +58,6 @@ jobs:
       GPU_OC_MHZ: ${{ inputs.gpu_oc_mhz }}
       GPU_OC_VOLT: ${{ inputs.gpu_oc_volt }}
       LITTLE_OC_MHZ: ${{ inputs.little_oc_mhz }}
-      LL_MID_MHZ: ${{ inputs.ll_mid_mhz }}
-      LL_MID_VOLT_IDX: ${{ inputs.ll_mid_volt_idx }}
       ZRAM_MAX_MB: ${{ inputs.zram_max_mb }}
     steps:
       - uses: actions/checkout@v4
@@ -303,18 +295,6 @@ jobs:
           done
           grep -n "CPU_DVFS_FREQ0_LL_C65" "$T"
 
-      # LL middle step: inserts ONE extra OPP (default 2000 MHz) at slot 1 of the LL table so the
-      # thermal cooler (cpu_adaptive) steps 2300 -> 2000 instead of 2300 -> 1682. The 16-slot table
-      # is shifted in header + PV table + post_div method table together (scripts/05_ll_mid_opp.py);
-      # the unused 501 MHz step is dropped. Must run AFTER the little cluster overclock step.
-      - name: LL middle OPP step (insert between top and 1682)
-        if: inputs.ll_mid_mhz != ''
-        run: |
-          set -e
-          test -f scripts/05_ll_mid_opp.py || { echo "::error::scripts/05_ll_mid_opp.py missing - re-upload T225_GitHub_Repo_Files.zip to Release src-v1"; exit 1; }
-          python3 scripts/05_ll_mid_opp.py "$WORK/src" "$LL_MID_MHZ" "${LL_MID_VOLT_IDX:-96}"
-          grep -n "CPU_DVFS_FREQ[0-3]_LL_C65T" "$WORK/src/drivers/misc/mediatek/base/power/cpufreq_v1/src/mach/mt6765/mtk_cpufreq_opp_table.h"
-
       # zram size cap: Android (fstab zramsize) writes 4 GB to /sys/block/zram0/disksize at boot.
       # The kernel clamps that single write to zram_max_mb, so zram is small from the very first
       # moment: no swapoff / reset / retry loop in userspace (that caused slowdowns and bootloops
@@ -458,7 +438,6 @@ jobs:
             "Toolchain: $TOOLCHAIN | I/O: $IOSCHED" \
             "GPU OC: ${GPU_OC_MHZ:-off} MHz / ${GPU_OC_VOLT:-stock}" \
             "LL OC: ${LITTLE_OC_MHZ:-off} MHz" \
-            "LL mid step: ${LL_MID_MHZ:-off} MHz" \
             "zram cap: ${ZRAM_MAX_MB:-off} MB" \
             "Kernel: ${KVER:-?}" \
             "Features: $FEATURES" \
