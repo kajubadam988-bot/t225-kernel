@@ -3,6 +3,10 @@ name: Build T225 KernelSU-Next kernel
 on:
   workflow_dispatch:
     inputs:
+      src_asset:
+        description: "Source tarball in Release src-v1"
+        required: false
+        default: "kernel_src.tar.gz"
       ksu_ref:
         description: "legacy | legacy-susfs | legacy-susfs-nomount | legacy-susfs-manual | legacy-susfs-nomount-manual | susfs-*   Suffix @auto (e.g. legacy-susfs-manual@auto) = driver commit auto-matched to the Manager's UAPI; @<commit> = fixed commit"
         default: "legacy-susfs-manual@auto"
@@ -49,6 +53,7 @@ jobs:
       OUTDIR: ${{ github.workspace }}/_out
       GH_TOKEN: ${{ github.token }}
       KSU_REF: ${{ inputs.ksu_ref }}
+      SRC_ASSET: ${{ inputs.src_asset }}
       APK_URL: ${{ inputs.manager_apk_url }}
       FEATURES: ${{ inputs.features }}
       TOOLCHAIN: ${{ inputs.toolchain }}
@@ -67,7 +72,8 @@ jobs:
 
       - name: Download kernel source and build files (Release src-v1)
         run: |
-          gh release download src-v1 -R "$GITHUB_REPOSITORY" -p kernel_src.tar.gz -p T225_GitHub_Repo_Files.zip
+          gh release download src-v1 -R "$GITHUB_REPOSITORY" -p "${SRC_ASSET:-kernel_src.tar.gz}" -p T225_GitHub_Repo_Files.zip
+          [ "${SRC_ASSET:-kernel_src.tar.gz}" = kernel_src.tar.gz ] || mv -f "$SRC_ASSET" kernel_src.tar.gz
           unzip -oq T225_GitHub_Repo_Files.zip -x '.github/*'
 
       # I/O scheduler: patches the boot script in the zip, and adds a 'bfq' feature to
