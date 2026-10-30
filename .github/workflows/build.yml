@@ -75,9 +75,6 @@ jobs:
           gh release download src-v1 -R "$GITHUB_REPOSITORY" -p "${SRC_ASSET:-kernel_src.tar.gz}" -p T225_GitHub_Repo_Files.zip
           [ "${SRC_ASSET:-kernel_src.tar.gz}" = kernel_src.tar.gz ] || mv -f "$SRC_ASSET" kernel_src.tar.gz
           unzip -oq T225_GitHub_Repo_Files.zip -x '.github/*'
-          mkdir -p "$WORK/ko"
-          gh release download src-v1 -R "$GITHUB_REPOSITORY" -p "*.ko" -D "$WORK/ko"
-          ls -l "$WORK/ko"
 
       # I/O scheduler: patches the boot script in the zip, and adds a 'bfq' feature to
       # 04_extra_features.sh (BFQ is not enabled in the stock T225 defconfig). Kyber is already built in.
