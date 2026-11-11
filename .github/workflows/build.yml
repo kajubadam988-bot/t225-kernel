@@ -329,6 +329,17 @@ jobs:
           PY
           grep -n -B1 -A6 "T225: cap zram" "$F"
 
+      # T225 USB HID: skip Samsung's hardcoded hid_data "HACK" block in f_hid.c
+      # when configfs report_desc is set (patch_fhid.py is in the repo root).
+      - name: Patch f_hid.c (USB HID gadget)
+        run: |
+          set -e
+          F="$WORK/src/drivers/usb/gadget/function/f_hid.c"
+          test -f "$F" || { echo "::error::f_hid.c not found"; exit 1; }
+          python3 "$GITHUB_WORKSPACE/patch_fhid.py" "$F"
+          grep -q "t225_skip_hack" "$F" || { echo "::error::f_hid.c patch did not apply"; exit 1; }
+          grep -n -B2 -A2 "t225_skip_hack" "$F"
+
       - name: Build kernel
         run: |
           bash scripts/02_build.sh
