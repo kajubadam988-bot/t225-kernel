@@ -409,6 +409,15 @@ jobs:
           done
           ls -l "$OUTDIR"
 
+      # Wi-Fi/BT safety net: every symbol the prebuilt vendor modules (*.ko in Release src-v1) import must
+      # be exported by this kernel with the same CRC. Runs on the CRC-patched vmlinux, before anything is published.
+      - name: Check vendor Wi-Fi/BT modules resolve against this kernel
+        run: |
+          mkdir -p _ko
+          gh release download src-v1 -R "$GITHUB_REPOSITORY" -p '*.ko' -D _ko --clobber || true
+          ls -l _ko
+          python3 scripts/check_vendor_syms.py "$WORK/src/out/vmlinux" _ko
+
       - name: Publish Release
         run: |
           ZIP=$(ls "$OUTDIR"/*.zip)
