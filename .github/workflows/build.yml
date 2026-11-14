@@ -171,7 +171,7 @@ jobs:
           p = "scripts/02_build.sh"
           s = open(p).read()
           flags = ('KCFLAGS="-w -Wno-error -Wno-implicit-function-declaration -Wno-int-conversion '
-                   '-Wno-incompatible-function-pointer-types -Wno-implicit-int '
+                   '-Wno-incompatible-function-pointer-types -Wno-incompatible-pointer-types -Wno-implicit-int '
                    '-Wno-deprecated-non-prototype -Wno-strict-prototypes"')
           assert "KCFLAGS=-w" in s
           open(p, "w").write(s.replace("KCFLAGS=-w", flags, 1))
