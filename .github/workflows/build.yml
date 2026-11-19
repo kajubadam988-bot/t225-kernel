@@ -40,6 +40,9 @@ on:
       zram_max_mb:
         description: "Cap zram size inside the kernel (MB, 512-8192). Android asks for 4096; the kernel clamps it at boot, so no swapoff/reset is needed. Empty = off (stays 4 GB, default now)"
         default: ""
+      thermal_hot_c:
+        description: "OC thermal watchdog (CPU temp in C, 60-85). The zip installs a KernelSU service.d script: PPM THERMAL policy is OFF at boot (needed to reach the top OPPs), switched back ON above this temp and OFF again 10 C lower. Empty = nothing installed (stock thermal policy, OC top OPPs stay capped)"
+        default: "70"
 
 permissions:
   contents: write
@@ -64,6 +67,7 @@ jobs:
       GPU_OC_VOLT: ${{ inputs.gpu_oc_volt }}
       LITTLE_OC_MHZ: ${{ inputs.little_oc_mhz }}
       ZRAM_MAX_MB: ${{ inputs.zram_max_mb }}
+      THERMAL_HOT_C: ${{ inputs.thermal_hot_c }}
     steps:
       - uses: actions/checkout@v4
 
@@ -103,6 +107,109 @@ jobs:
           sed -i "s|echo deadline > \"\$q/scheduler\"|echo $IOSCHED > \"\$q/scheduler\"|" ak3_template/ramdisk/sbin/t225-perf-extra.sh
           grep -n 'scheduler' ak3_template/ramdisk/sbin/t225-perf-extra.sh
           grep -q "echo $IOSCHED > " ak3_template/ramdisk/sbin/t225-perf-extra.sh || { echo "::error::scheduler line not patched"; exit 1; }
+
+      # OC thermal watchdog. The PPM THERMAL policy caps the CPU at OPP idx 1 (2000 mW budget), so the
+      # overclocked top OPPs are never reached while it is on. This puts a KernelSU service.d script in the
+      # zip (tools/eem_offset.sh) and appends a block to anykernel.sh that copies it to /data/adb/service.d
+      # at flash time. The script turns THERMAL off at boot, back on above thermal_hot_c (hottest thermal
+      # zone), and off again 10 C lower. Empty thermal_hot_c = step skipped = stock thermal policy.
+      - name: Thermal watchdog (service.d script inside the zip)
+        if: inputs.thermal_hot_c != ''
+        run: |
+          set -e
+          case "$THERMAL_HOT_C" in ''|*[!0-9]*) echo "::error::thermal_hot_c must be a number"; exit 1 ;; esac
+          [ "$THERMAL_HOT_C" -ge 60 ] && [ "$THERMAL_HOT_C" -le 85 ] || { echo "::error::thermal_hot_c must be 60-85"; exit 1; }
+          test -f ak3_template/anykernel.sh || { echo "::error::ak3_template/anykernel.sh not found"; exit 1; }
+          mkdir -p ak3_template/tools
+          cat > ak3_template/tools/eem_offset.sh <<'EEMEOF'
+          #!/system/bin/sh
+          # T225 OC thermal watchdog (KernelSU service.d). Installed by the kernel zip.
+          # 1 step of EEM offset = 6.25 mV, positive = higher voltage (0 = stock, works at 2501/2300 MHz).
+          OFFSET_L=0    # cpu0-3 (EEM_DET_L)
+          OFFSET_2L=0   # cpu4-7 (EEM_DET_2L)
+          HOT=70000     # millidegrees C: THERMAL policy back ON at/above this
+          COOL=60000    # millidegrees C: THERMAL policy OFF again at/below this
+          LOG=/data/local/tmp/eem_wd.log
+
+          while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 5; done
+          sleep 30
+
+          echo $OFFSET_L > /proc/eem/EEM_DET_L/eem_offset
+          echo $OFFSET_2L > /proc/eem/EEM_DET_2L/eem_offset
+
+          # PPM THERMAL is idx 4 in policy_status (it is [5] in dump_policy_list). Its fixed 2000 mW
+          # budget caps the max OPP at idx 1, so the top OPPs are never used while it is on.
+          echo 4 0 > /proc/ppm/policy_status
+          echo "$(date) boot: THERMAL policy off" > $LOG
+
+          max_temp() {
+            T=0
+            for z in /sys/class/thermal/thermal_zone*/temp; do
+              v=$(cat $z 2>/dev/null)
+              case "$v" in ''|*[!0-9]*) continue ;; esac
+              [ "$v" -gt "$T" ] && T=$v
+            done
+            echo $T
+          }
+
+          thermal_is_off() {
+            grep PPM_POLICY_THERMAL /proc/ppm/policy_status 2>/dev/null | grep -qi disabled
+          }
+
+          (
+            STATE=off
+            while true; do
+              T=$(max_temp)
+              if [ "$T" -ge "$HOT" ]; then
+                echo 4 1 > /proc/ppm/policy_status
+                [ "$STATE" = "off" ] && echo "$(date) HOT $T -> THERMAL on" >> $LOG
+                STATE=on
+              elif [ "$T" -le "$COOL" ]; then
+                if [ "$STATE" = "on" ] || ! thermal_is_off; then
+                  echo 4 0 > /proc/ppm/policy_status
+                  echo "$(date) COOL $T -> THERMAL off" >> $LOG
+                  STATE=off
+                fi
+              fi
+              sleep 3
+            done
+          ) &
+          EEMEOF
+          sed -i "s/^HOT=[0-9]*/HOT=$(( THERMAL_HOT_C * 1000 ))/; s/^COOL=[0-9]*/COOL=$(( (THERMAL_HOT_C - 10) * 1000 ))/" ak3_template/tools/eem_offset.sh
+          chmod 755 ak3_template/tools/eem_offset.sh
+          sh -n ak3_template/tools/eem_offset.sh
+          grep -n '^HOT=\|^COOL=' ak3_template/tools/eem_offset.sh
+          if ! grep -q "T225 thermal watchdog" ak3_template/anykernel.sh; then
+            echo >> ak3_template/anykernel.sh
+            cat >> ak3_template/anykernel.sh <<'AKEOF'
+          ui_print " ";
+          ui_print "=== T225 thermal watchdog (OC) ===";
+          mount /data 2>/dev/null;
+          SVC=/data/adb/service.d;
+          if [ -d /data/adb ]; then
+            mkdir -p "$SVC" 2>/dev/null;
+            cp -f "$AKHOME/tools/eem_offset.sh" "$SVC/eem_offset.sh" 2>/dev/null;
+            if [ -s "$SVC/eem_offset.sh" ]; then
+              chmod 755 "$SVC/eem_offset.sh" 2>/dev/null;
+              restorecon "$SVC/eem_offset.sh" 2>/dev/null;
+              ui_print "Installed $SVC/eem_offset.sh";
+              ui_print "THERMAL policy off at boot, back on above __HOT__ C";
+              ui_print "Log: /data/local/tmp/eem_wd.log";
+            else
+              ui_print "Copy FAILED. Install tools/eem_offset.sh by hand";
+              ui_print "into /data/adb/service.d/ (chmod 755).";
+            fi;
+          else
+            ui_print "/data/adb not accessible (encrypted?), not installed.";
+            ui_print "Copy tools/eem_offset.sh from the zip to";
+            ui_print "/data/adb/service.d/ by hand (chmod 755).";
+          fi;
+          ui_print "=================================";
+          AKEOF
+            sed -i "s/__HOT__/$THERMAL_HOT_C/" ak3_template/anykernel.sh
+          fi
+          sh -n ak3_template/anykernel.sh
+          tail -n 24 ak3_template/anykernel.sh
 
       # Experimental: other clang instead of the crDroid clang 11.0.1.
       # It is unpacked to $WORK/toolchain_611, so 01_setup.sh skips its own git clone and
@@ -465,6 +572,7 @@ jobs:
             "GPU OC: ${GPU_OC_MHZ:-off} MHz / ${GPU_OC_VOLT:-stock}" \
             "LL OC: ${LITTLE_OC_MHZ:-off} MHz" \
             "zram cap: ${ZRAM_MAX_MB:-off} MB" \
+            "Thermal watchdog: ${THERMAL_HOT_C:-off} C" \
             "Kernel: ${KVER:-?}" \
             "Features: $FEATURES" \
             "APK bundled: $BUNDLE_APK" \
