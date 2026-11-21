@@ -49,6 +49,9 @@ on:
       runtime_tune:
         description: "on | off  (on = the zip also installs /data/adb/service.d/tune.sh: schedutil up_rate_limit_us 500 for snappier frequency ramp-up; sysfs only, resets on reboot)"
         default: "off"
+      zram_lz4_dict:
+        description: "on | off  EXPERIMENTAL. on = zram gets the T227U-style modular LZ4 backend plus an opt-in LZ4 dictionary (sysfs comp_dictionary_size / comp_dictionary, set before disksize). No dictionary loaded = plain lz4 as before. Saves RAM, does not make the phone faster"
+        default: "off"
 
 permissions:
   contents: write
@@ -67,6 +70,7 @@ jobs:
       FEATURES: ${{ inputs.features }}
       PPM_GUARD: ${{ inputs.ppm_guard }}
       RUNTIME_TUNE: ${{ inputs.runtime_tune }}
+      ZRAM_LZ4_DICT: ${{ inputs.zram_lz4_dict }}
       TOOLCHAIN: ${{ inputs.toolchain }}
       BUNDLE_APK: ${{ inputs.bundle_apk }}
       LLVM_URL: ${{ inputs.llvm_url }}
@@ -503,6 +507,821 @@ jobs:
       - name: Setup (deps, toolchain, source, KernelSU-Next)
         run: bash scripts/01_setup.sh "$KSU_REF"
 
+      # zram LZ4 dictionary (port of the T227U r8 lz4-dictionary work, commit e952c89, onto this 4.19.200 tree).
+      # Adds drivers/block/zram/backend_lz4.[ch], a modular zcomp (zcomp_ops/params) and the sysfs files
+      # comp_dictionary_size + comp_dictionary. Off by default. Runs right after Setup, BEFORE the zram size cap
+      # step, so that step's text anchor is still found. "patch --dry-run" first: a source that does not match fails the build here.
+      - name: zram LZ4 dictionary support (kernel patch)
+        if: ${{ inputs.zram_lz4_dict == 'on' }}
+        run: |
+          set -e
+          cat > "$RUNNER_TEMP/zram_lz4dict.patch" <<'ZPATCHEOF'
+          diff -ruN a/drivers/block/zram/Makefile b/drivers/block/zram/Makefile
+          --- a/drivers/block/zram/Makefile	2026-11-21 09:26:06.013717994 +0530
+          +++ b/drivers/block/zram/Makefile	2026-11-21 09:26:06.016690699 +0530
+          @@ -1,3 +1,4 @@
+           zram-y	:=	zcomp.o zram_drv.o
+          +zram-$(CONFIG_CRYPTO_LZ4) += backend_lz4.o
+           
+           obj-$(CONFIG_ZRAM)	+=	zram.o
+          diff -ruN a/drivers/block/zram/backend_lz4.c b/drivers/block/zram/backend_lz4.c
+          --- a/drivers/block/zram/backend_lz4.c	1970-01-01 05:30:00.000000000 +0530
+          +++ b/drivers/block/zram/backend_lz4.c	2026-11-21 09:26:06.016642684 +0530
+          @@ -0,0 +1,85 @@
+          +// SPDX-License-Identifier: GPL-2.0-only
+          +#include <linux/errno.h>
+          +#include <linux/err.h>
+          +#include <linux/lz4.h>
+          +#include <linux/mm.h>
+          +#include <linux/string.h>
+          +#include <linux/vmalloc.h>
+          +
+          +#include "backend_lz4.h"
+          +
+          +static int lz4_setup_params(struct zcomp_params *params)
+          +{
+          +	LZ4_stream_t *dict_stream = vzalloc(sizeof(*dict_stream));
+          +
+          +	if (!dict_stream)
+          +		return -ENOMEM;
+          +	if (LZ4_loadDict(dict_stream, params->dict, params->dict_size) !=
+          +	    params->dict_size) {
+          +		vfree(dict_stream);
+          +		return -EINVAL;
+          +	}
+          +	params->dict_stream = dict_stream;
+          +	return 0;
+          +}
+          +
+          +static void lz4_release_params(struct zcomp_params *params)
+          +{
+          +	vfree(params->dict_stream);
+          +}
+          +
+          +static void *lz4_create_ctx(const char *name)
+          +{
+          +	void *workspace = vmalloc(LZ4_MEM_COMPRESS);
+          +
+          +	return workspace ? workspace : ERR_PTR(-ENOMEM);
+          +}
+          +
+          +static void lz4_destroy_ctx(void *workspace)
+          +{
+          +	vfree(workspace);
+          +}
+          +
+          +static int lz4_compress(const struct zcomp_params *params, void *workspace,
+          +			const void *src, void *dst, unsigned int *dst_len)
+          +{
+          +	int len;
+          +
+          +	if (params->dict_stream) {
+          +		/* Each compressed page starts with the same dictionary state. */
+          +		memcpy(workspace, params->dict_stream, sizeof(LZ4_stream_t));
+          +		len = LZ4_compress_fast_continue(workspace, src, dst, PAGE_SIZE,
+          +						 *dst_len, LZ4_ACCELERATION_DEFAULT);
+          +	} else {
+          +		len = LZ4_compress_default(src, dst, PAGE_SIZE, *dst_len, workspace);
+          +	}
+          +
+          +	if (!len)
+          +		return -EINVAL;
+          +
+          +	*dst_len = len;
+          +	return 0;
+          +}
+          +
+          +static int lz4_decompress(const struct zcomp_params *params,
+          +			  const void *src, unsigned int src_len, void *dst)
+          +{
+          +	int len;
+          +
+          +	if (params->dict)
+          +		len = LZ4_decompress_safe_usingDict(src, dst, src_len, PAGE_SIZE,
+          +						    params->dict, params->dict_size);
+          +	else
+          +		len = LZ4_decompress_safe(src, dst, src_len, PAGE_SIZE);
+          +
+          +	return len == PAGE_SIZE ? 0 : -EINVAL;
+          +}
+          +
+          +const struct zcomp_ops backend_lz4 = {
+          +	.setup_params = lz4_setup_params,
+          +	.release_params = lz4_release_params,
+          +	.create_ctx = lz4_create_ctx,
+          +	.destroy_ctx = lz4_destroy_ctx,
+          +	.compress = lz4_compress,
+          +	.decompress_stateless = lz4_decompress,
+          +};
+          diff -ruN a/drivers/block/zram/backend_lz4.h b/drivers/block/zram/backend_lz4.h
+          --- a/drivers/block/zram/backend_lz4.h	1970-01-01 05:30:00.000000000 +0530
+          +++ b/drivers/block/zram/backend_lz4.h	2026-11-21 09:26:06.016653799 +0530
+          @@ -0,0 +1,9 @@
+          +/* SPDX-License-Identifier: GPL-2.0-only */
+          +#ifndef _ZRAM_BACKEND_LZ4_H_
+          +#define _ZRAM_BACKEND_LZ4_H_
+          +
+          +#include "zcomp.h"
+          +
+          +extern const struct zcomp_ops backend_lz4;
+          +
+          +#endif /* _ZRAM_BACKEND_LZ4_H_ */
+          diff -ruN a/drivers/block/zram/zcomp.c b/drivers/block/zram/zcomp.c
+          --- a/drivers/block/zram/zcomp.c	2026-11-21 09:26:06.013730904 +0530
+          +++ b/drivers/block/zram/zcomp.c	2026-11-21 09:26:06.016498341 +0530
+          @@ -11,12 +11,22 @@
+           #include <linux/string.h>
+           #include <linux/err.h>
+           #include <linux/slab.h>
+          +#include <linux/vmalloc.h>
+           #include <linux/wait.h>
+           #include <linux/sched.h>
+           #include <linux/cpu.h>
+           #include <linux/crypto.h>
+           
+           #include "zcomp.h"
+          +#include "backend_lz4.h"
+          +
+          +struct zcomp_cpu {
+          +	struct zcomp_strm *stream;
+          +#ifdef CONFIG_ZRAM_LRU_WRITEBACK
+          +	/* Scratch space only for compressed writeback objects spanning pages. */
+          +	void *read_buf;
+          +#endif
+          +};
+           
+           static const char * const backends[] = {
+           	"lzo",
+          @@ -35,40 +45,69 @@
+           	NULL
+           };
+           
+          +static void *zcomp_crypto_create_ctx(const char *name)
+          +{
+          +	return crypto_alloc_comp(name, 0, 0);
+          +}
+          +
+          +static void zcomp_crypto_destroy_ctx(void *ctx)
+          +{
+          +	crypto_free_comp(ctx);
+          +}
+          +
+          +static int zcomp_crypto_compress(const struct zcomp_params *params, void *ctx,
+          +				 const void *src, void *dst, unsigned int *dst_len)
+          +{
+          +	return crypto_comp_compress(ctx, src, PAGE_SIZE, dst, dst_len);
+          +}
+          +
+          +static int zcomp_crypto_decompress(void *ctx, const void *src,
+          +				   unsigned int src_len, void *dst)
+          +{
+          +	unsigned int dst_len = PAGE_SIZE;
+          +
+          +	return crypto_comp_decompress(ctx, src, src_len, dst, &dst_len);
+          +}
+          +
+          +static const struct zcomp_ops backend_crypto = {
+          +	.create_ctx = zcomp_crypto_create_ctx,
+          +	.destroy_ctx = zcomp_crypto_destroy_ctx,
+          +	.compress = zcomp_crypto_compress,
+          +	.decompress = zcomp_crypto_decompress,
+          +};
+          +
+           static void zcomp_strm_free(struct zcomp_strm *zstrm)
+           {
+          -	if (!IS_ERR_OR_NULL(zstrm->tfm))
+          -		crypto_free_comp(zstrm->tfm);
+          +	if (!IS_ERR_OR_NULL(zstrm->ctx))
+          +		zstrm->ops->destroy_ctx(zstrm->ctx);
+           	free_pages((unsigned long)zstrm->buffer, 1);
+          -	if (zstrm->tmpbuf) {
+          -		free_pages((unsigned long)zstrm->tmpbuf, 1);
+          -		zstrm->tmpbuf = NULL;
+          -	}
+           	kfree(zstrm);
+           }
+           
+          -/*
+          - * allocate new zcomp_strm structure with ->tfm initialized by
+          - * backend, return NULL on error
+          - */
+          +/* Allocate a stream and its backend context, or return NULL on failure. */
+           static struct zcomp_strm *zcomp_strm_alloc(struct zcomp *comp)
+           {
+          -	struct zcomp_strm *zstrm = kmalloc(sizeof(*zstrm), GFP_KERNEL);
+          +	struct zcomp_strm *zstrm = kzalloc(sizeof(*zstrm), GFP_KERNEL);
+           	if (!zstrm)
+           		return NULL;
+           
+          -	zstrm->tfm = crypto_alloc_comp(comp->name, 0, 0);
+          +	zstrm->ops = comp->ops;
+          +	zstrm->ctx = comp->ops->create_ctx(comp->name);
+          +	if (IS_ERR_OR_NULL(zstrm->ctx))
+          +		goto fail;
+           	/*
+           	 * allocate 2 pages. 1 for compressed data, plus 1 extra for the
+           	 * case when compressed size is larger than the original one
+           	 */
+           	zstrm->buffer = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
+          -	zstrm->tmpbuf = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
+          -	if (IS_ERR_OR_NULL(zstrm->tfm) || !zstrm->buffer || !zstrm->tmpbuf) {
+          -		zcomp_strm_free(zstrm);
+          -		zstrm = NULL;
+          -	}
+          +	if (!zstrm->buffer)
+          +		goto fail;
+          +
+           	return zstrm;
+          +
+          +fail:
+          +	zcomp_strm_free(zstrm);
+          +	return NULL;
+           }
+           
+           bool zcomp_available_algorithm(const char *comp)
+          @@ -89,6 +128,11 @@
+           	return crypto_has_comp(comp, 0, 0) == 1;
+           }
+           
+          +bool zcomp_supports_dict(const char *comp)
+          +{
+          +	return IS_REACHABLE(CONFIG_CRYPTO_LZ4) && !strcmp(comp, "lz4");
+          +}
+          +
+           /* show available compressors */
+           ssize_t zcomp_available_show(const char *comp, char *buf)
+           {
+          @@ -121,15 +165,27 @@
+           
+           struct zcomp_strm *zcomp_stream_get(struct zcomp *comp)
+           {
+          -	return *get_cpu_ptr(comp->stream);
+          +	return get_cpu_ptr(comp->cpu)->stream;
+           }
+           
+           void zcomp_stream_put(struct zcomp *comp)
+           {
+          -	put_cpu_ptr(comp->stream);
+          +	put_cpu_ptr(comp->cpu);
+           }
+           
+          -int zcomp_compress(struct zcomp_strm *zstrm,
+          +#ifdef CONFIG_ZRAM_LRU_WRITEBACK
+          +void *zcomp_read_buf_get(struct zcomp *comp)
+          +{
+          +	return get_cpu_ptr(comp->cpu)->read_buf;
+          +}
+          +
+          +void zcomp_read_buf_put(struct zcomp *comp)
+          +{
+          +	put_cpu_ptr(comp->cpu);
+          +}
+          +#endif
+          +
+          +int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
+           		const void *src, unsigned int *dst_len)
+           {
+           	/*
+          @@ -148,27 +204,33 @@
+           	 */
+           	*dst_len = PAGE_SIZE * 2;
+           
+          -	return crypto_comp_compress(zstrm->tfm,
+          -			src, PAGE_SIZE,
+          -			zstrm->buffer, dst_len);
+          +	return zstrm->ops->compress(&comp->params, zstrm->ctx, src,
+          +				    zstrm->buffer, dst_len);
+           }
+           
+          -int zcomp_decompress(struct zcomp_strm *zstrm,
+          +int zcomp_decompress(struct zcomp *comp,
+           		const void *src, unsigned int src_len, void *dst)
+           {
+          -	unsigned int dst_len = PAGE_SIZE;
+          +	struct zcomp_strm *zstrm;
+          +	int ret;
+           
+          -	return crypto_comp_decompress(zstrm->tfm,
+          -			src, src_len,
+          -			dst, &dst_len);
+          +	if (comp->ops->decompress_stateless)
+          +		return comp->ops->decompress_stateless(&comp->params, src,
+          +						      src_len, dst);
+          +
+          +	zstrm = zcomp_stream_get(comp);
+          +	ret = comp->ops->decompress(zstrm->ctx, src, src_len, dst);
+          +	zcomp_stream_put(comp);
+          +	return ret;
+           }
+           
+           int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
+           {
+           	struct zcomp *comp = hlist_entry(node, struct zcomp, node);
+          +	struct zcomp_cpu *cpu_data = per_cpu_ptr(comp->cpu, cpu);
+           	struct zcomp_strm *zstrm;
+           
+          -	if (WARN_ON(*per_cpu_ptr(comp->stream, cpu)))
+          +	if (WARN_ON(cpu_data->stream))
+           		return 0;
+           
+           	zstrm = zcomp_strm_alloc(comp);
+          @@ -176,19 +238,29 @@
+           		pr_err("Can't allocate a compression stream\n");
+           		return -ENOMEM;
+           	}
+          -	*per_cpu_ptr(comp->stream, cpu) = zstrm;
+          +#ifdef CONFIG_ZRAM_LRU_WRITEBACK
+          +	cpu_data->read_buf = (void *)get_zeroed_page(GFP_KERNEL);
+          +	if (!cpu_data->read_buf) {
+          +		zcomp_strm_free(zstrm);
+          +		return -ENOMEM;
+          +	}
+          +#endif
+          +	cpu_data->stream = zstrm;
+           	return 0;
+           }
+           
+           int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node)
+           {
+           	struct zcomp *comp = hlist_entry(node, struct zcomp, node);
+          -	struct zcomp_strm *zstrm;
+          +	struct zcomp_cpu *cpu_data = per_cpu_ptr(comp->cpu, cpu);
+           
+          -	zstrm = *per_cpu_ptr(comp->stream, cpu);
+          -	if (!IS_ERR_OR_NULL(zstrm))
+          -		zcomp_strm_free(zstrm);
+          -	*per_cpu_ptr(comp->stream, cpu) = NULL;
+          +	if (cpu_data->stream)
+          +		zcomp_strm_free(cpu_data->stream);
+          +	cpu_data->stream = NULL;
+          +#ifdef CONFIG_ZRAM_LRU_WRITEBACK
+          +	free_page((unsigned long)cpu_data->read_buf);
+          +	cpu_data->read_buf = NULL;
+          +#endif
+           	return 0;
+           }
+           
+          @@ -196,8 +268,8 @@
+           {
+           	int ret;
+           
+          -	comp->stream = alloc_percpu(struct zcomp_strm *);
+          -	if (!comp->stream)
+          +	comp->cpu = alloc_percpu(struct zcomp_cpu);
+          +	if (!comp->cpu)
+           		return -ENOMEM;
+           
+           	ret = cpuhp_state_add_instance(CPUHP_ZCOMP_PREPARE, &comp->node);
+          @@ -206,14 +278,17 @@
+           	return 0;
+           
+           cleanup:
+          -	free_percpu(comp->stream);
+          +	free_percpu(comp->cpu);
+           	return ret;
+           }
+           
+           void zcomp_destroy(struct zcomp *comp)
+           {
+           	cpuhp_state_remove_instance(CPUHP_ZCOMP_PREPARE, &comp->node);
+          -	free_percpu(comp->stream);
+          +	free_percpu(comp->cpu);
+          +	if (comp->ops->release_params)
+          +		comp->ops->release_params(&comp->params);
+          +	kvfree(comp->params.dict);
+           	kfree(comp);
+           }
+           
+          @@ -223,25 +298,47 @@
+            * backend pointer or ERR_PTR if things went bad. ERR_PTR(-EINVAL)
+            * if requested algorithm is not supported, ERR_PTR(-ENOMEM) in
+            * case of allocation error, or any other error potentially
+          - * returned by zcomp_init().
+          + * returned by zcomp_init(). The caller owns dict on failure; the returned
+          + * compressor owns it on success.
+            */
+          -struct zcomp *zcomp_create(const char *compress)
+          +struct zcomp *zcomp_create(const char *compress, void *dict, unsigned int dict_size)
+           {
+           	struct zcomp *comp;
+           	int error;
+           
+           	if (!zcomp_available_algorithm(compress))
+           		return ERR_PTR(-EINVAL);
+          +	if (dict && (!zcomp_supports_dict(compress) ||
+          +		     dict_size < ZCOMP_DICT_MIN || dict_size > ZCOMP_DICT_MAX))
+          +		return ERR_PTR(-EINVAL);
+          +	if (!dict && dict_size)
+          +		return ERR_PTR(-EINVAL);
+           
+           	comp = kzalloc(sizeof(struct zcomp), GFP_KERNEL);
+           	if (!comp)
+           		return ERR_PTR(-ENOMEM);
+           
+           	comp->name = compress;
+          -	error = zcomp_init(comp);
+          -	if (error) {
+          -		kfree(comp);
+          -		return ERR_PTR(error);
+          +	comp->ops = &backend_crypto;
+          +	if (IS_REACHABLE(CONFIG_CRYPTO_LZ4) && zcomp_supports_dict(compress))
+          +		comp->ops = &backend_lz4;
+          +
+          +	comp->params.dict = dict;
+          +	comp->params.dict_size = dict_size;
+          +	if (dict) {
+          +		error = comp->ops->setup_params(&comp->params);
+          +		if (error)
+          +			goto free_comp;
+           	}
+          +	error = zcomp_init(comp);
+          +	if (error)
+          +		goto release_params;
+           	return comp;
+          +
+          +release_params:
+          +	if (comp->ops->release_params)
+          +		comp->ops->release_params(&comp->params);
+          +free_comp:
+          +	kfree(comp);
+          +	return ERR_PTR(error);
+           }
+          diff -ruN a/drivers/block/zram/zcomp.h b/drivers/block/zram/zcomp.h
+          --- a/drivers/block/zram/zcomp.h	2026-11-21 09:26:06.013742873 +0530
+          +++ b/drivers/block/zram/zcomp.h	2026-11-21 09:26:06.016571081 +0530
+          @@ -10,17 +10,46 @@
+           #ifndef _ZCOMP_H_
+           #define _ZCOMP_H_
+           
+          +#define ZCOMP_DICT_MIN 8U
+          +#define ZCOMP_DICT_MAX (64U * 1024)
+          +
+          +/* Immutable after the compressor is initialized. */
+          +struct zcomp_params {
+          +	void *dict;
+          +	unsigned int dict_size;
+          +	void *dict_stream;
+          +};
+          +
+          +/* Context setup and teardown run outside the I/O path. */
+          +struct zcomp_ops {
+          +	int (*setup_params)(struct zcomp_params *params);
+          +	void (*release_params)(struct zcomp_params *params);
+          +	void *(*create_ctx)(const char *name);
+          +	void (*destroy_ctx)(void *ctx);
+          +	int (*compress)(const struct zcomp_params *params, void *ctx,
+          +			const void *src, void *dst, unsigned int *dst_len);
+          +	int (*decompress)(void *ctx, const void *src, unsigned int src_len,
+          +			  void *dst);
+          +	int (*decompress_stateless)(const struct zcomp_params *params,
+          +				    const void *src, unsigned int src_len,
+          +				    void *dst);
+          +};
+          +
+           struct zcomp_strm {
+           	/* compression/decompression buffer */
+           	void *buffer;
+          -	struct crypto_comp *tfm;
+          -	void *tmpbuf;
+          +	const struct zcomp_ops *ops;
+          +	void *ctx;
+           };
+           
+          +struct zcomp_cpu;
+          +
+           /* dynamic per-device compression frontend */
+           struct zcomp {
+          -	struct zcomp_strm * __percpu *stream;
+          +	struct zcomp_cpu __percpu *cpu;
+           	const char *name;
+          +	const struct zcomp_ops *ops;
+          +	struct zcomp_params params;
+           	struct hlist_node node;
+           };
+           
+          @@ -28,17 +57,23 @@
+           int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node);
+           ssize_t zcomp_available_show(const char *comp, char *buf);
+           bool zcomp_available_algorithm(const char *comp);
+          +bool zcomp_supports_dict(const char *comp);
+           
+          -struct zcomp *zcomp_create(const char *comp);
+          +struct zcomp *zcomp_create(const char *comp, void *dict, unsigned int dict_size);
+           void zcomp_destroy(struct zcomp *comp);
+           
+           struct zcomp_strm *zcomp_stream_get(struct zcomp *comp);
+           void zcomp_stream_put(struct zcomp *comp);
+           
+          -int zcomp_compress(struct zcomp_strm *zstrm,
+          +#ifdef CONFIG_ZRAM_LRU_WRITEBACK
+          +void *zcomp_read_buf_get(struct zcomp *comp);
+          +void zcomp_read_buf_put(struct zcomp *comp);
+          +#endif
+          +
+          +int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
+           		const void *src, unsigned int *dst_len);
+           
+          -int zcomp_decompress(struct zcomp_strm *zstrm,
+          +int zcomp_decompress(struct zcomp *comp,
+           		const void *src, unsigned int src_len, void *dst);
+           
+           bool zcomp_set_max_streams(struct zcomp *comp, int num_strm);
+          diff -ruN a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+          --- a/drivers/block/zram/zram_drv.c	2026-11-21 09:26:06.013756178 +0530
+          +++ b/drivers/block/zram/zram_drv.c	2026-11-21 09:26:10.942580979 +0530
+          @@ -2211,7 +2211,6 @@
+           	struct zram_wb_work *zw = container_of(work, struct zram_wb_work, work);
+           	struct zram_wb_header *zhdr;
+           	struct zram *zram = zw->zram;
+          -	struct zcomp_strm *zstrm;
+           	struct page **src_page = zw->src_page;
+           	struct page *dst_page = zw->dst_page;
+           	struct bio *bio = zw->bio;
+          @@ -2223,6 +2222,7 @@
+           	int ret = 0;
+           	u32 index;
+           	u8 *src, *dst, *src_decomp;
+          +	void *read_buf = NULL;
+           	bool spanned;
+           
+           	if (zw->ppr) {
+          @@ -2248,24 +2248,22 @@
+           		goto out;
+           	}
+           
+          +	spanned = offset + header_sz + size > PAGE_SIZE;
+          +	if (spanned)
+          +		kunmap_atomic(src);
+           	dst = kmap_atomic(dst_page);
+          -	zstrm = zcomp_stream_get(zram->comp);
+          -	spanned = (offset + header_sz + size > PAGE_SIZE) ? true : false;
+           	if (spanned) {
+          -		kunmap_atomic(src);
+           		if (size == PAGE_SIZE) {
+           			copy_to_buf(dst, src_page, page_idx, offset + header_sz, size);
+          -			goto out_huge;
+          +			goto out_unmap;
+           		}
+          -		src = zstrm->tmpbuf;
+          -		copy_to_buf(src, src_page, page_idx, offset + header_sz, size);
+          -		src_decomp = src;
+          +		read_buf = zcomp_read_buf_get(zram->comp);
+          +		copy_to_buf(read_buf, src_page, page_idx, offset + header_sz, size);
+          +		src_decomp = read_buf;
+           	} else {
+           		src_decomp = src + offset + header_sz;
+           	}
+          -	ret = zcomp_decompress(zstrm, src_decomp, size, dst);
+          -out_huge:
+          -	zcomp_stream_put(zram->comp);
+          +	ret = zcomp_decompress(zram->comp, src_decomp, size, dst);
+           	if (ret) {
+           		struct hex_dump_pages hdp;
+           
+          @@ -2275,6 +2273,9 @@
+           		handle_decomp_fail(zram->compressor, ret, offset + header_sz,
+           				   src_decomp, size, &hdp);
+           	}
+          +	if (read_buf)
+          +		zcomp_read_buf_put(zram->comp);
+          +out_unmap:
+           	kunmap_atomic(dst);
+           	if (!spanned)
+           		kunmap_atomic(src);
+          @@ -2535,6 +2536,15 @@
+           	return sz;
+           }
+           
+          +/* Serialized by init_lock, including reset and disk initialization. */
+          +static void zram_clear_staged_dict(struct zram *zram)
+          +{
+          +	kvfree(zram->dict);
+          +	zram->dict = NULL;
+          +	zram->dict_size = 0;
+          +	zram->dict_written = 0;
+          +}
+          +
+           static ssize_t comp_algorithm_store(struct device *dev,
+           		struct device_attribute *attr, const char *buf, size_t len)
+           {
+          @@ -2558,11 +2568,87 @@
+           		return -EBUSY;
+           	}
+           
+          +	if (strcmp(zram->compressor, compressor))
+          +		zram_clear_staged_dict(zram);
+           	strcpy(zram->compressor, compressor);
+           	up_write(&zram->init_lock);
+           	return len;
+           }
+           
+          +static ssize_t comp_dictionary_size_show(struct device *dev,
+          +		struct device_attribute *attr, char *buf)
+          +{
+          +	struct zram *zram = dev_to_zram(dev);
+          +	unsigned int size;
+          +
+          +	down_read(&zram->init_lock);
+          +	size = init_done(zram) ? zram->comp->params.dict_size : zram->dict_size;
+          +	up_read(&zram->init_lock);
+          +
+          +	return scnprintf(buf, PAGE_SIZE, "%u\n", size);
+          +}
+          +
+          +static ssize_t comp_dictionary_size_store(struct device *dev,
+          +		struct device_attribute *attr, const char *buf, size_t len)
+          +{
+          +	struct zram *zram = dev_to_zram(dev);
+          +	unsigned int size;
+          +	void *dict = NULL;
+          +	ssize_t ret;
+          +
+          +	ret = kstrtouint(buf, 10, &size);
+          +	if (ret)
+          +		return ret;
+          +	if (size && (size < ZCOMP_DICT_MIN || size > ZCOMP_DICT_MAX))
+          +		return -EINVAL;
+          +
+          +	down_write(&zram->init_lock);
+          +	if (init_done(zram) || READ_ONCE(zram->claim)) {
+          +		ret = -EBUSY;
+          +		goto out;
+          +	}
+          +	if (size) {
+          +		if (!zcomp_supports_dict(zram->compressor)) {
+          +			ret = -EOPNOTSUPP;
+          +			goto out;
+          +		}
+          +		dict = kvmalloc(size, GFP_KERNEL);
+          +		if (!dict) {
+          +			ret = -ENOMEM;
+          +			goto out;
+          +		}
+          +	}
+          +	zram_clear_staged_dict(zram);
+          +	zram->dict = dict;
+          +	zram->dict_size = size;
+          +	ret = len;
+          +out:
+          +	up_write(&zram->init_lock);
+          +	return ret;
+          +}
+          +
+          +static ssize_t comp_dictionary_write(struct file *file, struct kobject *kobj,
+          +		struct bin_attribute *attr, char *buf, loff_t pos, size_t count)
+          +{
+          +	struct zram *zram = dev_to_zram(kobj_to_dev(kobj));
+          +	ssize_t ret;
+          +
+          +	down_write(&zram->init_lock);
+          +	if (init_done(zram) || READ_ONCE(zram->claim)) {
+          +		ret = -EBUSY;
+          +	} else if (!zram->dict || pos != zram->dict_written) {
+          +		ret = -EINVAL;
+          +	} else if (count > zram->dict_size - zram->dict_written) {
+          +		ret = -EFBIG;
+          +	} else {
+          +		memcpy(zram->dict + pos, buf, count);
+          +		zram->dict_written += count;
+          +		ret = count;
+          +	}
+          +	up_write(&zram->init_lock);
+          +	return ret;
+          +}
+          +
+           static ssize_t compact_store(struct device *dev,
+           		struct device_attribute *attr, const char *buf, size_t len)
+           {
+          @@ -2917,12 +3003,9 @@
+           		kunmap_atomic(dst);
+           		ret = 0;
+           	} else {
+          -		struct zcomp_strm *zstrm = zcomp_stream_get(zram->comp);
+          -
+           		dst = kmap_atomic(page);
+          -		ret = zcomp_decompress(zstrm, src, size, dst);
+          +		ret = zcomp_decompress(zram->comp, src, size, dst);
+           		kunmap_atomic(dst);
+          -		zcomp_stream_put(zram->comp);
+           	}
+           
+           	/* Should NEVER happen. BUG() if it does. */
+          @@ -3011,7 +3094,7 @@
+           compress_again:
+           	zstrm = zcomp_stream_get(zram->comp);
+           	src = kmap_atomic(page);
+          -	ret = zcomp_compress(zstrm, src, &comp_len);
+          +	ret = zcomp_compress(zram->comp, zstrm, src, &comp_len);
+           	kunmap_atomic(src);
+           
+           	if (unlikely(ret)) {
+          @@ -3378,6 +3461,7 @@
+           	down_write(&zram->init_lock);
+           
+           	zram->limit_pages = 0;
+          +	zram_clear_staged_dict(zram);
+           
+           	if (!init_done(zram)) {
+           		up_write(&zram->init_lock);
+          @@ -3412,11 +3496,15 @@
+           		return -EINVAL;
+           
+           	down_write(&zram->init_lock);
+          -	if (init_done(zram)) {
+          +	if (init_done(zram) || READ_ONCE(zram->claim)) {
+           		pr_info("Cannot change disksize for initialized device\n");
+           		err = -EBUSY;
+           		goto out_unlock;
+           	}
+          +	if (zram->dict_written != zram->dict_size) {
+          +		err = -ENODATA;
+          +		goto out_unlock;
+          +	}
+           
+           	disksize = PAGE_ALIGN(disksize);
+           	if (!zram_meta_alloc(zram, disksize)) {
+          @@ -3424,7 +3512,7 @@
+           		goto out_unlock;
+           	}
+           
+          -	comp = zcomp_create(zram->compressor);
+          +	comp = zcomp_create(zram->compressor, zram->dict, zram->dict_size);
+           	if (IS_ERR(comp)) {
+           		pr_err("Cannot initialise %s compressing backend\n",
+           				zram->compressor);
+          @@ -3432,6 +3520,11 @@
+           		goto out_free_meta;
+           	}
+           
+          +	/* The compressor now owns the dictionary, including during teardown. */
+          +	zram->dict = NULL;
+          +	zram->dict_size = 0;
+          +	zram->dict_written = 0;
+          +
+           	if (!strncmp(zram->compressor, "lzo-rle", 7))
+           		is_lzorle = true;
+           
+          @@ -3529,6 +3622,9 @@
+           static DEVICE_ATTR_WO(idle);
+           static DEVICE_ATTR_RW(max_comp_streams);
+           static DEVICE_ATTR_RW(comp_algorithm);
+          +static DEVICE_ATTR_RW(comp_dictionary_size);
+          +static BIN_ATTR(comp_dictionary, 0200, NULL, comp_dictionary_write,
+          +		ZCOMP_DICT_MAX);
+           #ifdef CONFIG_ZRAM_WRITEBACK
+           static DEVICE_ATTR_RW(backing_dev);
+           static DEVICE_ATTR_WO(writeback);
+          @@ -3546,6 +3642,7 @@
+           	&dev_attr_idle.attr,
+           	&dev_attr_max_comp_streams.attr,
+           	&dev_attr_comp_algorithm.attr,
+          +	&dev_attr_comp_dictionary_size.attr,
+           #ifdef CONFIG_ZRAM_WRITEBACK
+           	&dev_attr_backing_dev.attr,
+           	&dev_attr_writeback.attr,
+          @@ -3561,8 +3658,14 @@
+           	NULL,
+           };
+           
+          +static struct bin_attribute *zram_disk_bin_attrs[] = {
+          +	&bin_attr_comp_dictionary,
+          +	NULL,
+          +};
+          +
+           static const struct attribute_group zram_disk_attr_group = {
+           	.attrs = zram_disk_attrs,
+          +	.bin_attrs = zram_disk_bin_attrs,
+           };
+           
+           static const struct attribute_group *zram_disk_attr_groups[] = {
+          diff -ruN a/drivers/block/zram/zram_drv.h b/drivers/block/zram/zram_drv.h
+          --- a/drivers/block/zram/zram_drv.h	2026-11-21 09:26:06.013802532 +0530
+          +++ b/drivers/block/zram/zram_drv.h	2026-11-21 09:26:06.016664430 +0530
+          @@ -190,6 +190,10 @@
+           	 */
+           	u64 disksize;	/* bytes */
+           	char compressor[CRYPTO_MAX_ALG_NAME];
+          +	/* Staging buffer, transferred to zcomp only on successful init. */
+          +	void *dict;
+          +	unsigned int dict_size;
+          +	unsigned int dict_written;
+           	/*
+           	 * zram is claimed so open request will be failed
+           	 */
+          ZPATCHEOF
+          cd "$WORK/src"
+          patch -p1 --dry-run < "$RUNNER_TEMP/zram_lz4dict.patch" || { echo "::error::zram LZ4 dictionary patch does not apply to this source"; exit 1; }
+          patch -p1 < "$RUNNER_TEMP/zram_lz4dict.patch"
+          test -f drivers/block/zram/backend_lz4.c || { echo "::error::backend_lz4.c missing after patch"; exit 1; }
+          grep -q "comp_dictionary_size" drivers/block/zram/zram_drv.c || { echo "::error::dictionary sysfs not in zram_drv.c"; exit 1; }
+          grep -n "backend_lz4" drivers/block/zram/Makefile
+          # the dictionary backend is only compiled with CONFIG_CRYPTO_LZ4=y (zram's own Kconfig selects only LZO)
+          DEF=arch/arm64/configs/gta7lite_defconfig
+          if ! grep -q '^CONFIG_CRYPTO_LZ4=y' "$DEF"; then
+            printf '\nCONFIG_CRYPTO_LZ4=y\n' >> "$DEF"
+            echo "defconfig: CONFIG_CRYPTO_LZ4=y added"
+          fi
+
       # GPU overclock: SM-T225 uses the MT6765 "segment 3" GPU table (680/500/400 MHz).
       # Only the top row is changed (680 MHz -> gpu_oc_mhz, 0.800 V -> gpu_oc_volt).
       # VSRAM stays 0.875 V. gpu_oc_mhz empty = step skipped = stock GPU.
@@ -669,6 +1488,16 @@ jobs:
           tail -n 3 "$WORK/build.log"
           grep -q 'BUILD_EXIT=0' "$WORK/build.log"
 
+      # zram LZ4 dictionary: the new backend must really be part of the kernel (needs CONFIG_CRYPTO_LZ4=y).
+      - name: Check zram LZ4 dictionary backend was built
+        if: ${{ inputs.zram_lz4_dict == 'on' }}
+        run: |
+          cd "$WORK/src"
+          grep -E '^(# )?CONFIG_(CRYPTO_LZ4|ZRAM)[= ]' out/.config || true
+          grep -q '^CONFIG_CRYPTO_LZ4=y' out/.config || { echo "::error::CONFIG_CRYPTO_LZ4 is not =y, the dictionary backend is not built"; exit 1; }
+          test -f out/drivers/block/zram/backend_lz4.o || { echo "::error::backend_lz4.o was not built"; exit 1; }
+          echo "zram LZ4 dictionary backend OK"
+
       # Right after the build: show which compiler/config was used and check the export-table
       # format. The WiFi/BT CRC patch in the packaging step needs 8-byte __ksymtab entries (one 4-byte
       # __kcrctab entry each). Some toolchains/options produce 16-byte entries -> the zip would be
@@ -793,6 +1622,7 @@ jobs:
             "Thermal watchdog: ${THERMAL_HOT_C:-off} C" \
             "PPM guard: ${PPM_GUARD:-off}" \
             "Runtime tune: ${RUNTIME_TUNE:-off}" \
+            "ZRAM LZ4 dict: ${ZRAM_LZ4_DICT:-off}" \
             "Kernel: ${KVER:-?}" \
             "Features: $FEATURES" \
             "APK bundled: $BUNDLE_APK" \
