@@ -41,7 +41,7 @@ on:
         description: "Cap zram size inside the kernel (MB, 512-8192). Android asks for 4096; the kernel clamps it at boot, so no swapoff/reset is needed. Empty = off (stays 4 GB, default now)"
         default: ""
       thermal_hot_c:
-        description: "OC thermal watchdog (CPU temp in C, 60-85). The zip installs a KernelSU service.d script: PPM THERMAL policy is OFF at boot (needed to reach the top OPPs), switched back ON above this temp and OFF again 10 C lower. Empty = nothing installed (stock thermal policy, OC top OPPs stay capped)"
+        description: "OC thermal watchdog (CPU temp in C, 60-85). The zip installs a KernelSU service.d script: full OC (2501/2300 MHz) below this temp; at/above it a real PPM power budget (1500 mW, 1000 mW from +6 C) caps the CPU, released 10 C lower. The stock 2000 mW thermal budget caps nothing. PPM THERMAL policy stays enabled. Empty = nothing installed (stock thermal behaviour)"
         default: "70"
 
 permissions:
@@ -108,11 +108,10 @@ jobs:
           grep -n 'scheduler' ak3_template/ramdisk/sbin/t225-perf-extra.sh
           grep -q "echo $IOSCHED > " ak3_template/ramdisk/sbin/t225-perf-extra.sh || { echo "::error::scheduler line not patched"; exit 1; }
 
-      # OC thermal watchdog. The PPM THERMAL policy caps the CPU at OPP idx 1 (2000 mW budget), so the
-      # overclocked top OPPs are never reached while it is on. This puts a KernelSU service.d script in the
-      # zip (tools/eem_offset.sh) and appends a block to anykernel.sh that copies it to /data/adb/service.d
-      # at flash time. The script turns THERMAL off at boot, back on above thermal_hot_c (hottest thermal
-      # zone), and off again 10 C lower. Empty thermal_hot_c = step skipped = stock thermal policy.
+      # OC thermal watchdog. The stock thermal driver's 2000 mW budget caps nothing (measured), so this puts a KernelSU service.d script
+      # in the zip (tools/eem_offset.sh) and appends a block to anykernel.sh that copies it to /data/adb/service.d at flash time.
+      # Below thermal_hot_c the script lifts mild stock caps; at/above it forces a real budget (1500 mW, 1000 mW from +6 C) through
+      # /proc/ppm/policy/thermal_limit (hottest thermal zone) and releases it 10 C lower. Empty = step skipped = stock behaviour.
       - name: Thermal watchdog (service.d script inside the zip)
         if: inputs.thermal_hot_c != ''
         run: |
@@ -127,20 +126,25 @@ jobs:
           # 1 step of EEM offset = 6.25 mV, positive = higher voltage (0 = stock, works at 2501/2300 MHz).
           OFFSET_L=0    # cpu0-3 (EEM_DET_L)
           OFFSET_2L=0   # cpu4-7 (EEM_DET_2L)
-          HOT=70000     # millidegrees C: THERMAL policy back ON at/above this
-          COOL=60000    # millidegrees C: THERMAL policy OFF again at/below this
+          HOT=70000     # millidegrees C: at/above this a real power cap (CAP1_MW) is forced
+          COOL=60000    # millidegrees C: at/below this the forced cap is released again
+          CAP1_MW=1500  # measured: THERMAL policy max OPP idx 3 (cpu0-3 2074 MHz, cpu4-7 1491 MHz)
+          CAP2_MW=1000  # measured: idx 6 (1879 / 1226 MHz), used from HOT + 6 C
+          HOT2=$((HOT + 6000))
           LOG=/data/local/tmp/eem_wd.log
+          PPM=/proc/ppm
 
-          while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 5; done
-          sleep 30
+          # Measured on the tablet (4 busy loops): budget >= 1900 mW caps nothing, 1800/1700 -> idx 1,
+          # 1600 -> 2, 1500..1300 -> 3, 1200 -> 4, 1100 -> 5, 1000 -> 6, 800 -> 9. The stock thermal driver's
+          # 2000 mW budget therefore protects very little. The PPM THERMAL policy stays ENABLED here.
+          # Below HOT: a mild stock cap (>= max power - 100 mW) is lifted by writing budget 0 to
+          # /proc/ppm/policy/thermal_limit. At/above HOT: CAP1_MW (CAP2_MW from HOT2) is forced and
+          # re-forced whenever the driver replaces it with something weaker. Released at COOL.
 
-          echo $OFFSET_L > /proc/eem/EEM_DET_L/eem_offset
-          echo $OFFSET_2L > /proc/eem/EEM_DET_2L/eem_offset
-
-          # PPM THERMAL is idx 4 in policy_status (it is [5] in dump_policy_list). Its fixed 2000 mW
-          # budget caps the max OPP at idx 1, so the top OPPs are never used while it is on.
-          echo 4 0 > /proc/ppm/policy_status
-          echo "$(date) boot: THERMAL policy off" > $LOG
+          log() {
+            echo "$(date) $*" >> $LOG
+            [ "$(wc -c < $LOG 2>/dev/null)" -gt 100000 ] && echo "$(date) log reset" > $LOG
+          }
 
           max_temp() {
             T=0
@@ -153,27 +157,64 @@ jobs:
           }
 
           thermal_is_off() {
-            grep PPM_POLICY_THERMAL /proc/ppm/policy_status 2>/dev/null | grep -qi disabled
+            grep PPM_POLICY_THERMAL $PPM/policy_status 2>/dev/null | grep -qi disabled
           }
 
-          (
-            STATE=off
-            while true; do
-              T=$(max_temp)
-              if [ "$T" -ge "$HOT" ]; then
-                echo 4 1 > /proc/ppm/policy_status
-                [ "$STATE" = "off" ] && echo "$(date) HOT $T -> THERMAL on" >> $LOG
-                STATE=on
-              elif [ "$T" -le "$COOL" ]; then
-                if [ "$STATE" = "on" ] || ! thermal_is_off; then
-                  echo 4 0 > /proc/ppm/policy_status
-                  echo "$(date) COOL $T -> THERMAL off" >> $LOG
-                  STATE=off
-                fi
+          get_limit() {
+            N=$(sed -n 's/^limited power = //p' $PPM/policy/thermal_limit 2>/dev/null)
+            A=$(sed -n 's/^PPM thermal activate = //p' $PPM/policy/thermal_limit 2>/dev/null)
+            MAXP=$(sed -n 's/^max power = //p' $PPM/policy/thermal_cur_power 2>/dev/null)
+            [ -n "$N" ] || N=0
+            [ -n "$A" ] || A=0
+            [ -n "$MAXP" ] || MAXP=2020
+          }
+
+          wd_step() {
+            T=$(max_temp)
+            if thermal_is_off; then
+              echo 4 1 > $PPM/policy_status
+              log "policy was off -> enabled"
+            fi
+            if [ "$T" -ge "$HOT" ]; then STATE=hot
+            elif [ "$T" -le "$COOL" ]; then STATE=cool
+            fi
+            get_limit
+            if [ "$STATE" = "cool" ]; then
+              if [ "$A" = "1" ] && { [ "$N" -ge $((MAXP - 100)) ] || [ "$N" -eq "$CAP1_MW" ] || [ "$N" -eq "$CAP2_MW" ]; }; then
+                echo 0 > $PPM/policy/thermal_limit
+                log "cool $T mC: cap ($N mW) released"
               fi
-              sleep 3
-            done
-          ) &
+            else
+              WANT=$CAP1_MW
+              [ "$T" -ge "$HOT2" ] && WANT=$CAP2_MW
+              if [ "$A" != "1" ] || [ "$N" -gt "$WANT" ]; then
+                echo $WANT > $PPM/policy/thermal_limit
+                log "HOT $T mC: cap $WANT mW forced"
+              fi
+            fi
+          }
+
+          start_watchdog() {
+            while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 5; done
+            sleep 30
+
+            echo $OFFSET_L > /proc/eem/EEM_DET_L/eem_offset
+            echo $OFFSET_2L > /proc/eem/EEM_DET_2L/eem_offset
+
+            # PPM THERMAL is idx 4 in policy_status (it is [5] in dump_policy_list); keep it enabled
+            echo 4 1 > $PPM/policy_status
+            echo "$(date) boot: full OC below $((HOT / 1000)) C, power cap $CAP1_MW mW above ($CAP2_MW mW from $((HOT2 / 1000)) C)" > $LOG
+
+            (
+              STATE=cool
+              while true; do
+                wd_step
+                sleep 3
+              done
+            ) &
+          }
+
+          [ "$WD_LIB" = "1" ] || start_watchdog
           EEMEOF
           sed -i "s/^HOT=[0-9]*/HOT=$(( THERMAL_HOT_C * 1000 ))/; s/^COOL=[0-9]*/COOL=$(( (THERMAL_HOT_C - 10) * 1000 ))/" ak3_template/tools/eem_offset.sh
           chmod 755 ak3_template/tools/eem_offset.sh
@@ -193,7 +234,7 @@ jobs:
               chmod 755 "$SVC/eem_offset.sh" 2>/dev/null;
               restorecon "$SVC/eem_offset.sh" 2>/dev/null;
               ui_print "Installed $SVC/eem_offset.sh";
-              ui_print "THERMAL policy off at boot, back on above __HOT__ C";
+              ui_print "Full OC below __HOT__ C, real power cap above";
               ui_print "Log: /data/local/tmp/eem_wd.log";
             else
               ui_print "Copy FAILED. Install tools/eem_offset.sh by hand";
