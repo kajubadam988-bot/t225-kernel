@@ -552,8 +552,9 @@ jobs:
             echo "Manager APK NOT bundled (bundle_apk=$BUNDLE_APK)"
           fi
           bash scripts/03_package.sh "$APK"
+          # final name: <toolchain>_<build number>_<original name>, all dashes turned into underscores
           for f in "$OUTDIR"/T225_*.zip; do
-            mv "$f" "$OUTDIR/${TOOLCHAIN}-$(basename "$f")"
+            mv "$f" "$OUTDIR/${TOOLCHAIN}_${GITHUB_RUN_NUMBER}_$(basename "$f" | tr '-' '_')"
           done
           ls -l "$OUTDIR"
 
@@ -607,6 +608,7 @@ jobs:
           CAPTION=$(printf '%s\n' \
             "✅ T225 build #${{ github.run_number }} OK" \
             "KernelSU-Next: $KSU_REF" \
+            "Tarball: ${SRC_ASSET:-?}" \
             "Driver: $KSUV @ $KSUC" \
             "Compiler: $CC" \
             "Toolchain: $TOOLCHAIN | I/O: $IOSCHED" \
