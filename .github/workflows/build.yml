@@ -43,6 +43,12 @@ on:
       thermal_hot_c:
         description: "OC thermal watchdog (CPU temp in C, 60-85). The zip installs a KernelSU service.d script: full OC (2501/2300 MHz) below this temp; at/above it a real PPM power budget (1500 mW, 1000 mW from +6 C) caps the CPU, released 10 C lower. The stock 2000 mW thermal budget caps nothing. PPM THERMAL policy stays enabled. Empty = nothing installed (stock thermal behaviour)"
         default: "70"
+      ppm_guard:
+        description: "on | off  (on = PPM no longer overwrites the governor/Kernel Adiutor min/max, it is only intersected with them; patches cpufreq_v1 mtk_cpufreq_main.c)"
+        default: "off"
+      runtime_tune:
+        description: "on | off  (on = the zip also installs /data/adb/service.d/tune.sh: schedutil up_rate_limit_us 500 for snappier frequency ramp-up; sysfs only, resets on reboot)"
+        default: "off"
 
 permissions:
   contents: write
@@ -59,6 +65,8 @@ jobs:
       SRC_ASSET: ${{ inputs.src_asset }}
       APK_URL: ${{ inputs.manager_apk_url }}
       FEATURES: ${{ inputs.features }}
+      PPM_GUARD: ${{ inputs.ppm_guard }}
+      RUNTIME_TUNE: ${{ inputs.runtime_tune }}
       TOOLCHAIN: ${{ inputs.toolchain }}
       BUNDLE_APK: ${{ inputs.bundle_apk }}
       LLVM_URL: ${{ inputs.llvm_url }}
@@ -251,6 +259,90 @@ jobs:
           fi
           sh -n ak3_template/anykernel.sh
           tail -n 24 ak3_template/anykernel.sh
+
+      # Optional runtime tuning script (KernelSU service.d), same install method as the thermal watchdog. Off by default.
+      - name: Runtime tune (service.d script inside the zip)
+        if: ${{ inputs.runtime_tune == 'on' }}
+        run: |
+          set -e
+          test -f ak3_template/anykernel.sh || { echo "::error::ak3_template/anykernel.sh not found"; exit 1; }
+          mkdir -p ak3_template/tools
+          cat > ak3_template/tools/tune.sh <<'TUNEEOF'
+          #!/system/bin/sh
+          # T225 runtime tuning (KernelSU service.d). Safe: every setting is optional,
+          # skipped if its sysfs file is missing, and logged as "old -> new".
+          # Nothing is permanent: sysfs values reset on reboot. To remove: rm this file, reboot.
+          UP_RATE_US=500        # schedutil: how often frequency may RISE (smaller = snappier)
+          # DOWN_RATE_US is left alone on purpose (keeps frequency from dropping too fast/slow)
+          ROOT=${TUNE_ROOT:-}   # only for testing; empty on the phone
+          LOG=${TUNE_LOG:-/data/local/tmp/tune.log}
+
+          log() { echo "$(date) $*" >> "$LOG"; }
+
+          setv() {  # setv <file> <value>
+            f="$1"; v="$2"
+            [ -w "$f" ] || { log "skip (not writable): $f"; return 1; }
+            old=$(cat "$f" 2>/dev/null)
+            if [ "$old" = "$v" ]; then log "unchanged $f = $v"; return 0; fi
+            if echo "$v" > "$f" 2>/dev/null; then
+              new=$(cat "$f" 2>/dev/null)
+              log "$f: $old -> $new"
+            else
+              log "FAILED write $v to $f (was $old)"
+            fi
+          }
+
+          run() {
+            if [ -z "$TUNE_NOWAIT" ]; then
+              while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 5; done
+              sleep 45   # after eem_offset.sh and the boot rush
+            fi
+            echo "$(date) tune start" > "$LOG"
+
+            # schedutil rate limit. T225 kernel: tunables are GLOBAL in
+            #    /sys/devices/system/cpu/cpufreq/schedutil/ (not per policy).
+            USING=0
+            for p in $ROOT/sys/devices/system/cpu/cpufreq/policy*; do
+              [ "$(cat $p/scaling_governor 2>/dev/null)" = "schedutil" ] && USING=1
+            done
+            G=$ROOT/sys/devices/system/cpu/cpufreq/schedutil
+            if [ "$USING" = "1" ] && [ -e "$G/up_rate_limit_us" ]; then
+              setv "$G/up_rate_limit_us" "$UP_RATE_US"
+            else
+              log "schedutil not active or no up_rate_limit_us, no rate-limit change"
+            fi
+            log "tune done"
+          }
+
+          ( run ) &
+          TUNEEOF
+          chmod 755 ak3_template/tools/tune.sh
+          sh -n ak3_template/tools/tune.sh
+          if ! grep -q "T225 runtime tune" ak3_template/anykernel.sh; then
+            echo >> ak3_template/anykernel.sh
+            cat >> ak3_template/anykernel.sh <<'AKEOF'
+          ui_print " ";
+          ui_print "=== T225 runtime tune ===";
+          mount /data 2>/dev/null;
+          if [ -d /data/adb ]; then
+            mkdir -p /data/adb/service.d 2>/dev/null;
+            cp -f "$AKHOME/tools/tune.sh" /data/adb/service.d/tune.sh 2>/dev/null;
+            if [ -s /data/adb/service.d/tune.sh ]; then
+              chmod 755 /data/adb/service.d/tune.sh 2>/dev/null;
+              restorecon /data/adb/service.d/tune.sh 2>/dev/null;
+              ui_print "Installed /data/adb/service.d/tune.sh";
+              ui_print "Log: /data/local/tmp/tune.log";
+            else
+              ui_print "Copy FAILED. Install tools/tune.sh by hand";
+            fi;
+          else
+            ui_print "/data/adb not accessible, tune.sh not installed.";
+          fi;
+          ui_print "=========================";
+          AKEOF
+          fi
+          sh -n ak3_template/anykernel.sh
+          tail -n 22 ak3_template/anykernel.sh
 
       # Experimental: other clang instead of the crDroid clang 11.0.1.
       # It is unpacked to $WORK/toolchain_611, so 01_setup.sh skips its own git clone and
@@ -488,6 +580,89 @@ jobs:
           grep -q "t225_skip_hack" "$F" || { echo "::error::f_hid.c patch did not apply"; exit 1; }
           grep -n -B2 -A2 "t225_skip_hack" "$F"
 
+      # Optional: PPM policy guard (idea from senposage/T227U-KernelSU-Next). Off by default.
+      - name: Patch cpufreq (PPM policy guard)
+        if: ${{ inputs.ppm_guard == 'on' }}
+        run: |
+          set -e
+          cat > "$RUNNER_TEMP/patch_ppmguard.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """T225 PPM policy guard (same idea as senposage/T227U-KernelSU-Next).
+
+          Stock MTK code overwrites cpufreq policy->min/max with the PPM limits whenever
+          PPM changes. This patch keeps the governor / Kernel Adiutor selection
+          (policy->user_policy.min/max) and only INTERSECTS it with the PPM limits:
+            max = min(user_max, ppm_max)   min = max(user_min, ppm_min)
+          PPM thermal/power caps still win, because they only ever lower max.
+
+          usage: patch_ppmguard.py <mtk_cpufreq_main.c> [more files...]
+          exit 0 = patched or already patched, exit 1 = stock block not found.
+          """
+          import re, sys
+
+          MARK = "T225 ppm guard"
+
+          PAT = re.compile(
+              r"(?P<ind>[ \t]*)if \(pp->idx_opp_ppm_limit == -1\)\s*"
+              r"pp->mt_policy->max =\s*cpu_dvfs_get_max_freq\(pp\);\s*"
+              r"else\s*pp->mt_policy->max =\s*"
+              r"cpu_dvfs_get_freq_by_idx\(pp,\s*pp->idx_opp_ppm_limit\);\s*"
+              r"if \(pp->idx_opp_ppm_base == -1\)\s*"
+              r"pp->mt_policy->min =\s*cpu_dvfs_get_min_freq\(pp\);\s*"
+              r"else\s*pp->mt_policy->min =\s*"
+              r"cpu_dvfs_get_freq_by_idx\(pp,\s*pp->idx_opp_ppm_base\);"
+          )
+
+          NEW = """{ind}{{ /* {mark}: PPM is a safety envelope, keep the user selection */
+          {ind}\tunsigned int ppm_max, ppm_min, user_max, user_min;
+
+          {ind}\tif (pp->idx_opp_ppm_limit == -1)
+          {ind}\t\tppm_max = cpu_dvfs_get_max_freq(pp);
+          {ind}\telse
+          {ind}\t\tppm_max = cpu_dvfs_get_freq_by_idx(pp,
+          {ind}\t\t\tpp->idx_opp_ppm_limit);
+          {ind}\tif (pp->idx_opp_ppm_base == -1)
+          {ind}\t\tppm_min = cpu_dvfs_get_min_freq(pp);
+          {ind}\telse
+          {ind}\t\tppm_min = cpu_dvfs_get_freq_by_idx(pp,
+          {ind}\t\t\tpp->idx_opp_ppm_base);
+
+          {ind}\tuser_max = pp->mt_policy->user_policy.max;
+          {ind}\tuser_min = pp->mt_policy->user_policy.min;
+          {ind}\tpp->mt_policy->max = min(user_max, ppm_max);
+          {ind}\tpp->mt_policy->min = max(user_min, ppm_min);
+          {ind}\tif (pp->mt_policy->min > pp->mt_policy->max)
+          {ind}\t\tpp->mt_policy->min = pp->mt_policy->max;
+          {ind}}}"""
+
+          def patch(path):
+              s = open(path, encoding="utf-8", errors="surrogateescape").read()
+              if MARK in s or "user_policy.max" in s:
+                  print(f"{path}: already patched, skipped")
+                  return True
+              m = PAT.search(s)
+              if not m:
+                  print(f"{path}: stock MT_CPU_DVFS_PPM block not found")
+                  return False
+              new = NEW.format(ind=m.group("ind"), mark=MARK)
+              s = s[:m.start()] + new + s[m.end():]
+              open(path, "w", encoding="utf-8", errors="surrogateescape").write(s)
+              print(f"{path}: patched")
+              return True
+
+          if __name__ == "__main__":
+              ok = all([patch(p) for p in sys.argv[1:]]) if len(sys.argv) > 1 else False
+              sys.exit(0 if ok else 1)
+          PYEOF
+          D="$WORK/src/drivers/misc/mediatek/base/power/cpufreq_v1/src"
+          OK=0
+          for F in "$D/mtk_cpufreq_main.c" "$D/v2/mtk_cpufreq_main.c"; do
+            [ -f "$F" ] || continue
+            if python3 "$RUNNER_TEMP/patch_ppmguard.py" "$F"; then OK=1; fi
+          done
+          [ "$OK" = 1 ] || { echo "::error::PPM guard: stock block not found in any cpufreq_v1 main.c"; exit 1; }
+          grep -rn "T225 ppm guard" "$D" | head
+
       - name: Build kernel
         run: |
           bash scripts/02_build.sh
@@ -616,6 +791,8 @@ jobs:
             "LL OC: ${LITTLE_OC_MHZ:-off} MHz" \
             "zram cap: ${ZRAM_MAX_MB:-off} MB" \
             "Thermal watchdog: ${THERMAL_HOT_C:-off} C" \
+            "PPM guard: ${PPM_GUARD:-off}" \
+            "Runtime tune: ${RUNTIME_TUNE:-off}" \
             "Kernel: ${KVER:-?}" \
             "Features: $FEATURES" \
             "APK bundled: $BUNDLE_APK" \
