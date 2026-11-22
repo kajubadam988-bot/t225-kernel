@@ -47,7 +47,7 @@ on:
         description: "on | off  (on = PPM no longer overwrites the governor/Kernel Adiutor min/max, it is only intersected with them; patches cpufreq_v1 mtk_cpufreq_main.c)"
         default: "off"
       runtime_tune:
-        description: "on | off  (on = the zip also installs /data/adb/service.d/tune.sh: schedutil up_rate_limit_us 500 for snappier frequency ramp-up; sysfs only, resets on reboot)"
+        description: "on | off  (on = the zip also installs /data/adb/service.d/tune.sh: schedutil up_rate_limit_us 500, top-app schedtune boost 30 (raise only) + prefer_idle 1, vfs_cache_pressure 50, mmcblk0 queue rq_affinity/add_random/iostats; each one skipped if its file is missing; sysfs only, resets on reboot)"
         default: "off"
       zram_lz4_dict:
         description: "on | off  EXPERIMENTAL. on = zram gets the T227U-style modular LZ4 backend plus an opt-in LZ4 dictionary (sysfs comp_dictionary_size / comp_dictionary, set before disksize). No dictionary loaded = plain lz4 as before. Saves RAM, does not make the phone faster"
@@ -276,8 +276,15 @@ jobs:
           # T225 runtime tuning (KernelSU service.d). Safe: every setting is optional,
           # skipped if its sysfs file is missing, and logged as "old -> new".
           # Nothing is permanent: sysfs values reset on reboot. To remove: rm this file, reboot.
+          # An empty value below = that setting is skipped.
           UP_RATE_US=500        # schedutil: how often frequency may RISE (smaller = snappier)
           # DOWN_RATE_US is left alone on purpose (keeps frequency from dropping too fast/slow)
+          STUNE_BOOST=30        # /dev/stune/top-app/schedtune.boost, only RAISED to this value, never lowered
+          PREFER_IDLE=1         # /dev/stune/top-app/schedtune.prefer_idle: foreground threads go to idle CPUs first
+          VFS_PRESSURE=50       # vm.vfs_cache_pressure (default 100): keep dentry/inode cache longer
+          RQ_AFFINITY=2         # mmcblk0 queue: complete I/O on the submitting CPU
+          ADD_RANDOM=0          # mmcblk0 queue: do not feed the entropy pool from disk I/O
+          IOSTATS=0             # mmcblk0 queue: no per-request I/O accounting (less overhead)
           ROOT=${TUNE_ROOT:-}   # only for testing; empty on the phone
           LOG=${TUNE_LOG:-/data/local/tmp/tune.log}
 
@@ -296,6 +303,15 @@ jobs:
             fi
           }
 
+          raisev() {  # raisev <file> <minimum>: write only if the current number is lower
+            f="$1"; m="$2"
+            [ -w "$f" ] || { log "skip (not writable): $f"; return 1; }
+            cur=$(cat "$f" 2>/dev/null)
+            case "$cur" in ''|*[!0-9-]*) log "skip (not a number: '$cur'): $f"; return 1 ;; esac
+            if [ "$cur" -ge "$m" ]; then log "unchanged $f = $cur (already >= $m)"; return 0; fi
+            setv "$f" "$m"
+          }
+
           run() {
             if [ -z "$TUNE_NOWAIT" ]; then
               while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 5; done
@@ -310,11 +326,40 @@ jobs:
               [ "$(cat $p/scaling_governor 2>/dev/null)" = "schedutil" ] && USING=1
             done
             G=$ROOT/sys/devices/system/cpu/cpufreq/schedutil
-            if [ "$USING" = "1" ] && [ -e "$G/up_rate_limit_us" ]; then
-              setv "$G/up_rate_limit_us" "$UP_RATE_US"
-            else
-              log "schedutil not active or no up_rate_limit_us, no rate-limit change"
+            if [ -n "$UP_RATE_US" ]; then
+              if [ "$USING" = "1" ] && [ -e "$G/up_rate_limit_us" ]; then
+                setv "$G/up_rate_limit_us" "$UP_RATE_US"
+              else
+                log "schedutil not active or no up_rate_limit_us, no rate-limit change"
+              fi
             fi
+
+            # top-app boost (schedtune): helps the foreground app's threads get bigger/faster CPUs.
+            if [ -n "$STUNE_BOOST" ]; then
+              B=$ROOT/dev/stune/top-app/schedtune.boost
+              if [ -e "$B" ]; then raisev "$B" "$STUNE_BOOST"; else log "no schedtune top-app boost file here, skipped"; fi
+            fi
+            if [ -n "$PREFER_IDLE" ]; then
+              PI=$ROOT/dev/stune/top-app/schedtune.prefer_idle
+              if [ -e "$PI" ]; then setv "$PI" "$PREFER_IDLE"; else log "no schedtune top-app prefer_idle file here, skipped"; fi
+            fi
+
+            # page-cache / dentry pressure
+            [ -n "$VFS_PRESSURE" ] && setv "$ROOT/proc/sys/vm/vfs_cache_pressure" "$VFS_PRESSURE"
+
+            # eMMC queue
+            Q=$ROOT/sys/block/mmcblk0/queue
+            if [ -d "$Q" ]; then
+              [ -n "$RQ_AFFINITY" ] && setv "$Q/rq_affinity" "$RQ_AFFINITY"
+              [ -n "$ADD_RANDOM" ] && setv "$Q/add_random" "$ADD_RANDOM"
+              [ -n "$IOSTATS" ] && setv "$Q/iostats" "$IOSTATS"
+            else
+              log "no mmcblk0 queue dir, I/O settings skipped"
+            fi
+
+            # diagnostics only (nothing is written): what boost interfaces exist here
+            log "info perfmgr: $(ls $ROOT/proc/perfmgr 2>/dev/null | tr '\n' ' ')"
+            log "info stune groups: $(ls $ROOT/dev/stune 2>/dev/null | tr '\n' ' ')"
             log "tune done"
           }
 
