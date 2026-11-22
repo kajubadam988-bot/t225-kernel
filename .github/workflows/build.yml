@@ -47,7 +47,7 @@ on:
         description: "on | off  (on = PPM no longer overwrites the governor/Kernel Adiutor min/max, it is only intersected with them; patches cpufreq_v1 mtk_cpufreq_main.c)"
         default: "off"
       runtime_tune:
-        description: "on | off  (on = the zip also installs /data/adb/service.d/tune.sh: schedutil up_rate_limit_us 500, top-app schedtune boost 30 (raise only) + prefer_idle 1, vfs_cache_pressure 50, mmcblk0 queue rq_affinity/add_random/iostats; each one skipped if its file is missing; sysfs only, resets on reboot)"
+        description: "on | off  (on = the zip also installs /data/adb/service.d/tune.sh: schedutil up_rate_limit_us 500, top-app schedtune boost 30 (raise only) + prefer_idle 1, vfs_cache_pressure 50, tcp_slow_start_after_idle 0 + tcp_fastopen 3, mmcblk0 queue rq_affinity/add_random/iostats; each one skipped if its file is missing; sysfs only, resets on reboot)"
         default: "off"
       zram_lz4_dict:
         description: "on | off  EXPERIMENTAL. on = zram gets the T227U-style modular LZ4 backend plus an opt-in LZ4 dictionary (sysfs comp_dictionary_size / comp_dictionary, set before disksize). No dictionary loaded = plain lz4 as before. Saves RAM, does not make the phone faster"
@@ -285,6 +285,8 @@ jobs:
           RQ_AFFINITY=2         # mmcblk0 queue: complete I/O on the submitting CPU
           ADD_RANDOM=0          # mmcblk0 queue: do not feed the entropy pool from disk I/O
           IOSTATS=0             # mmcblk0 queue: no per-request I/O accounting (less overhead)
+          TCP_SSAI=0            # net.ipv4.tcp_slow_start_after_idle: keep full speed after a short pause
+          TCP_FASTOPEN=3        # net.ipv4.tcp_fastopen: client+server TCP Fast Open (default 1 = client only)
           ROOT=${TUNE_ROOT:-}   # only for testing; empty on the phone
           LOG=${TUNE_LOG:-/data/local/tmp/tune.log}
 
@@ -346,6 +348,10 @@ jobs:
 
             # page-cache / dentry pressure
             [ -n "$VFS_PRESSURE" ] && setv "$ROOT/proc/sys/vm/vfs_cache_pressure" "$VFS_PRESSURE"
+          
+            # network (TCP)
+            [ -n "$TCP_SSAI" ] && setv "$ROOT/proc/sys/net/ipv4/tcp_slow_start_after_idle" "$TCP_SSAI"
+            [ -n "$TCP_FASTOPEN" ] && setv "$ROOT/proc/sys/net/ipv4/tcp_fastopen" "$TCP_FASTOPEN"
 
             # eMMC queue
             Q=$ROOT/sys/block/mmcblk0/queue
