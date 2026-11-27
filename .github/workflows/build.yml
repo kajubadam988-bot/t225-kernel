@@ -10,8 +10,11 @@ on:
       ksu_ref:
         description: "legacy | legacy-susfs | legacy-susfs-nomount | legacy-susfs-manual | legacy-susfs-nomount-manual | susfs-*   Suffix @auto (e.g. legacy-susfs-manual@auto) = driver commit auto-matched to the Manager's UAPI; @<commit> = fixed commit"
         default: "legacy-susfs-manual@auto"
+      manager_source:
+        description: "Manager to fetch when manager_apk_url is empty: ksun (default) = latest KernelSU-Next (KSUN) spoofed manager | kowsu = latest KowSU manager"
+        default: "ksun"
       manager_apk_url:
-        description: "Direct link to the Manager .apk (optional; empty = latest *spoofed* APK from KernelSU-Next releases, else no APK)"
+        description: "Direct link to the Manager .apk (optional; empty = automatic, see manager_source)"
         default: ""
       bundle_apk:
         description: "true = also put the Manager .apk inside the flashable zip (bigger zip). false (default) = not bundled; the APK is still used at build time for the signature and version"
@@ -19,12 +22,15 @@ on:
       toolchain:
         description: "crdroid11 = original working clang 11.0.1 (default, safe) | neutron = latest Neutron Clang | zyc = latest ZyC Clang | slim = latest Slim LLVM (kernel.org) | llvm = upstream LLVM (see llvm_url)  [all except crdroid11 are experimental]"
         default: "crdroid11"
+      zyc_version:
+        description: "For toolchain=zyc only: ZyC Clang version to use, e.g. 14.0.6 (default) | 15.0.7 | 16.0.6 | latest (= newest version line)"
+        default: "14.0.6"
       llvm_url:
         description: "For neutron/zyc/slim/llvm only. Direct link to a Linux x86_64 .tar.xz / .tar.zst / .tar.gz (empty = auto: newest release of the chosen toolchain; llvm = LLVM 23.1.1 official)"
         default: ""
       features:
-        description: "Extra kernel features (space separated): bbr | bbrdef | perf | none  (bbr = BBR+FQ+FQ_CODEL available; bbrdef = also default cc/qdisc; perf = -O2 + BLK_WBT)"
-        default: "bbr bbrdef perf"
+        description: "Extra kernel features (space separated): bbr | bbrdef | perf | wireguard | nohuc | quietpod | lean | lean2 | nosec | none  (bbr = BBR+FQ+FQ_CODEL available; bbrdef = also default cc/qdisc; perf = -O2 + BLK_WBT; nohuc = HARDENED_USERCOPY off, Wi-Fi/BT safe)"
+        default: "bbr bbrdef perf nohuc nosec quietpod lean lean2"
       iosched:
         description: "I/O scheduler set at boot: deadline (default, same as before) | kyber | bfq  (bfq also turns on the BFQ kernel option automatically)"
         default: "deadline"
@@ -53,6 +59,18 @@ on:
         description: "on | off  EXPERIMENTAL. on = zram gets the T227U-style modular LZ4 backend plus an opt-in LZ4 dictionary (sysfs comp_dictionary_size / comp_dictionary, set before disksize). No dictionary loaded = plain lz4 as before. Saves RAM, does not make the phone faster"
         default: "off"
 
+      fetch_modules:
+        description: "true = also download the latest Play Integrity Fix + TrickyStore module zips and attach them to the release (install them from the KernelSU Manager; TrickyStore needs your own keybox.xml)"
+        default: "true"
+
+      send_telegram:
+        description: "true (default) = send the finished zip + info to Telegram (needs secrets TG_BOT_TOKEN and TG_CHAT_ID). false = skip"
+        default: "true"
+
+      boot_spoof_module:
+        description: "true (default) = also build a small KernelSU module (T225-BootSpoof.zip) that reports bootloader locked / verified boot green. Attached to the release. false = skip"
+        default: "true"
+
 permissions:
   contents: write
 
@@ -67,6 +85,9 @@ jobs:
       KSU_REF: ${{ inputs.ksu_ref }}
       SRC_ASSET: ${{ inputs.src_asset }}
       APK_URL: ${{ inputs.manager_apk_url }}
+      MANAGER_SOURCE: ${{ inputs.manager_source }}
+      ZYC_VERSION: ${{ inputs.zyc_version }}
+      FETCH_MODULES: ${{ inputs.fetch_modules }}
       FEATURES: ${{ inputs.features }}
       PPM_GUARD: ${{ inputs.ppm_guard }}
       RUNTIME_TUNE: ${{ inputs.runtime_tune }}
@@ -414,6 +435,12 @@ jobs:
                 URL=$(gh api repos/Neutron-Toolchains/clang-build-catalogue/releases/latest \
                   --jq '[.assets[] | select(.name | test("^neutron-clang-.*\\.tar\\.zst$"))][0].browser_download_url // empty') ;;
               zyc)
+                # ZYC_VERSION (default 14.0.6) picks the newest release of that version line
+                # (tag <ver>-<date>-release). ZYC_VERSION=latest = highest version line, newest date.
+                if [ "$ZYC_VERSION" != "latest" ] && [ -n "$ZYC_VERSION" ]; then
+                  URL=$(gh api --paginate "repos/ZyCromerZ/Clang/releases?per_page=100" \
+                    --jq '.[] | select(.tag_name | startswith("'"$ZYC_VERSION"'-")) | .assets[] | select(.name | test("\\.tar\\.(gz|xz|zst)$")) | .browser_download_url' | head -n 1 || true)
+                else
                 # ZyC publishes several clang lines (14.0.6, 16.0.6, 21.0.0git ...), and "releases/latest"
                 # returns whichever line was uploaded LAST -> random version. So pick the highest
                 # version line, newest date inside it (asset Clang-<ver>-<date>.tar.gz, ~570 MB).
@@ -430,7 +457,8 @@ jobs:
               key = (ver, int(m.group(2)))
               if best is None or key > best[0]: best = (key, u)
           print(best[1] if best else "")
-          ') ;;
+          ')
+                fi ;;
               slim)
                 # newest stable (non -rc) Slim LLVM from kernel.org
                 BASE="https://mirrors.edge.kernel.org/pub/tools/llvm/files"
@@ -473,26 +501,47 @@ jobs:
           PY
           grep -n "KCFLAGS" scripts/02_build.sh
 
-      # Manager APK: the given link, or the newest *spoofed* release APK of KernelSU-Next.
+      # Manager APK: the given link, or (default) the newest KowSU CI build.
+      # KowSU CI builds are only posted to Telegram (@kowsu_build), which a workflow cannot read.
+      # JiuGeFaCai/ReSukiSU_CI mirrors every one of them as a GitHub release (tag KowSU_<run id>,
+      # title "KowSU v3.3.0-165-g44758e19_32766"), so the newest one is taken from there.
+      # If that fails it falls back to the newest *spoofed* KernelSU-Next APK (with a warning).
       # The driver is NOT affected: it always comes from KSU_REF. The APK's signing cert is
       # added to the driver's accepted managers (KSU_EXTRA_CERTS) so a newer Manager is accepted.
-      - name: Fetch Manager APK (latest spoofed unless a link is given)
+      - name: Fetch Manager APK (latest KowSU unless a link is given)
         run: |
           mkdir -p _apk
-          URL="$APK_URL"
-          if [ -z "$URL" ]; then
+          URL="$APK_URL"; REL_NAME=""
+          SRC_M=$(echo "$MANAGER_SOURCE" | tr 'A-Z' 'a-z' | tr -d ' ')
+          case "$SRC_M" in kowsu|ksun) ;; *) echo "::error::manager_source must be 'kowsu' or 'ksun' (got '$MANAGER_SOURCE')"; exit 1 ;; esac
+          if [ -z "$URL" ] && [ "$SRC_M" = "kowsu" ]; then
+            ROW=$(gh api "repos/JiuGeFaCai/ReSukiSU_CI/releases?per_page=100" \
+              --jq '[.[] | select(.tag_name | startswith("KowSU_")) | select(any(.assets[]; .name | test("\\.apk$")))]
+                    | sort_by(.published_at) | reverse | .[0] // empty
+                    | [.name, ([.assets[] | select(.name | test("\\.apk$"))][0].browser_download_url)] | @tsv' || true)
+            REL_NAME=$(printf '%s' "$ROW" | cut -f1)
+            URL=$(printf '%s' "$ROW" | cut -f2)
+            [ -z "$URL" ] && { echo "::error::manager_source=kowsu but no KowSU APK found on the mirror (use manager_apk_url or manager_source=ksun)"; exit 1; }
+            echo "Latest KowSU release: $REL_NAME"
+          elif [ -z "$URL" ]; then
             URL=$(gh api "repos/KernelSU-Next/KernelSU-Next/releases?per_page=10" \
               --jq '[.[].assets[] | select(.name | test("spoofed.*release\\.apk$"))][0].browser_download_url // empty' || true)
+            [ -z "$URL" ] && { echo "::error::manager_source=ksun but no spoofed KernelSU-Next APK found"; exit 1; }
           fi
-          if [ -n "$URL" ] && curl -fsSL -o _apk/manager.apk "$URL" && [ -s _apk/manager.apk ]; then
+          if [ -n "$URL" ] && curl -fsSL --retry 3 -o _apk/manager.apk "$URL" && [ -s _apk/manager.apk ]; then
             echo "Manager APK: $URL"
             CERT=$(python3 -I scripts/apk_cert_info.py --extra _apk/manager.apk)
             echo "Manager cert: $CERT"
             echo "KSU_EXTRA_CERTS=$CERT" >> "$GITHUB_ENV"
-            # Driver reports the same version as the Manager (e.g. v3.4.2 / 33355) instead of the
-            # branch's own tag/commit count (v3.4.0-legacy / 33313). Read from the APK file name.
+            # Driver reports the same version as the Manager (e.g. v3.3.0 / 32766) instead of the
+            # branch's own tag/commit count. Read from the APK file name (or the KowSU release title).
             NAME=$(basename "${URL%%\?*}")
-            if [[ "$NAME" =~ _v([0-9]+\.[0-9]+\.[0-9]+)[^_]*_([0-9]+)-release\.apk$ ]]; then
+            echo "MANAGER_NAME=$NAME" >> "$GITHUB_ENV"
+            # keep a copy with its original name; it is attached to the release below
+            mkdir -p _mods && cp _apk/manager.apk "_mods/$NAME"
+            RX1='_v([0-9]+\.[0-9]+\.[0-9]+)[^_]*_([0-9]+)-release\.apk$'
+            RX2=' v([0-9]+\.[0-9]+\.[0-9]+)[^_ ]*_([0-9]+)$'
+            if [[ "$NAME" =~ $RX1 ]] || [[ "$REL_NAME" =~ $RX2 ]]; then
               echo "KSU_VERSION_TAG_OVERRIDE=v${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
               echo "KSU_VERSION_OVERRIDE=${BASH_REMATCH[2]}" >> "$GITHUB_ENV"
               echo "Driver version will be pinned to v${BASH_REMATCH[1]} (${BASH_REMATCH[2]})"
@@ -1622,18 +1671,71 @@ jobs:
           ls -l _ko
           python3 scripts/check_vendor_syms.py "$WORK/src/out/vmlinux" _ko
 
+      # Userspace KernelSU modules (NOT part of the kernel): newest release zip of each.
+      # A failed download only warns; it never fails the kernel build.
+      - name: Fetch latest Play Integrity Fix + TrickyStore modules
+        if: inputs.fetch_modules == 'true'
+        run: |
+          mkdir -p _mods
+          get() {  # $1 = owner/repo   $2 = output name prefix
+            URL=$(gh api "repos/$1/releases/latest" \
+              --jq '[.assets[] | select(.name | test("\\.zip$")) | select(.name | test("debug|source";"i") | not)][0].browser_download_url // empty' || true)
+            if [ -n "$URL" ] && curl -fsSL --retry 3 -o "_mods/$2-$(basename "$URL")" "$URL" && [ -s "_mods/$2-$(basename "$URL")" ]; then
+              echo "Module $2: $URL"
+            else
+              echo "::warning::could not fetch module $2 from $1"
+            fi
+          }
+          get osm0sis/PlayIntegrityFork PIF
+          get 5ec1cff/TrickyStore TrickyStore
+          ls -l _mods
+
+      # Small KernelSU module: sets the boot-state props at boot so apps see a locked bootloader.
+      # Props only (no hardware attestation). For Play Integrity still use PIF + TrickyStore + valid keybox.
+      - name: Build Boot-State Spoof module
+        if: inputs.boot_spoof_module == 'true'
+        run: |
+          mkdir -p _mods _bs
+          cat > _bs/module.prop <<'EOF'
+          id=t225_bootspoof
+          name=T225 Boot State Spoof
+          version=v1
+          versionCode=1
+          author=souvik
+          description=Reports the bootloader as locked / verified boot green (props only). Use with PIF + TrickyStore for Play Integrity.
+          EOF
+          cat > _bs/post-fs-data.sh <<'EOF'
+          #!/system/bin/sh
+          RP=resetprop
+          command -v resetprop >/dev/null 2>&1 || RP=/data/adb/ksu/bin/resetprop
+          sp() { "$RP" -n "$1" "$2"; }
+          sp ro.boot.verifiedbootstate green
+          sp ro.boot.flash.locked 1
+          sp ro.boot.vbmeta.device_state locked
+          sp ro.boot.veritymode enforcing
+          sp ro.boot.warranty_bit 0
+          sp ro.warranty_bit 0
+          sp ro.secure 1
+          sp ro.debuggable 0
+          EOF
+          chmod 755 _bs/post-fs-data.sh
+          (cd _bs && zip -qr ../_mods/T225-BootSpoof.zip .)
+          ls -l _mods
+
       - name: Publish Release
         run: |
           ZIP=$(ls "$OUTDIR"/*.zip)
-          gh release create "build-${{ github.run_number }}" "$ZIP" \
+          MODS=$(ls _mods/*.zip _mods/*.apk 2>/dev/null || true)
+          gh release create "build-${{ github.run_number }}" "$ZIP" $MODS \
             --title "T225 build #${{ github.run_number }} ($KSU_REF | $TOOLCHAIN | $IOSCHED)" \
-            --notes "Auto-built flashable zip (toolchain: $TOOLCHAIN). Check after flashing: boots, WiFi/Bluetooth, overclock. Keep a known-good zip for TWRP."
+            --notes "Auto-built flashable zip (toolchain: $TOOLCHAIN). If present, the attached Manager .apk is the app to install; the PIF/TrickyStore/BootSpoof zips are modules: install them in the KernelSU Manager (TrickyStore needs your own keybox.xml). Check after flashing: boots, WiFi/Bluetooth, overclock. Keep a known-good zip for TWRP."
 
       # Upload the finished zip to Telegram (needs repo secrets TG_BOT_TOKEN and TG_CHAT_ID).
       # Runs only after a successful build; a Telegram problem never fails the build.
       # The caption now carries the real compiler version, kernel version, size, hashes,
       # driver version, commit and build time (Telegram caption limit is 1024 characters).
       - name: Send zip to Telegram
+        if: success() && inputs.send_telegram == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -1676,6 +1778,7 @@ jobs:
             "ZRAM LZ4 dict: ${ZRAM_LZ4_DICT:-off}" \
             "Kernel: ${KVER:-?}" \
             "Features: $FEATURES" \
+            "Manager: ${MANAGER_NAME:-none}" \
             "APK bundled: $BUNDLE_APK" \
             "Size: $SIZE | Time: $DUR" \
             "MD5: $MD5" \
@@ -1690,6 +1793,19 @@ jobs:
           else
             echo "::warning::Telegram upload failed:"; cat tg_resp.json 2>/dev/null || true
           fi
+
+      - name: Notify Telegram on failure
+        if: failure() && inputs.send_telegram == 'true'
+        continue-on-error: true
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ] && exit 0
+          curl -sS "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d chat_id="$TG_CHAT_ID" \
+            --data-urlencode "text=❌ T225 build #${{ github.run_number }} FAILED (toolchain: $TOOLCHAIN, ref: $KSU_REF)
+          https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Keep build log on failure
         if: failure()
